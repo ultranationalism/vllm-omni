@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="Tongyi-MAI/Z-Image-Turbo",
+        default="ultranationalism/nunchaku-z-image-turbo",
         help="Diffusion model name or local path. Must be a quantized checkpoint with Nunchaku SVDQuant weights.",
     )
     parser.add_argument(
