@@ -173,7 +173,21 @@ class ZImagePipeline(nn.Module):
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
         )
-        self.transformer = ZImageTransformer2DModel()
+        
+        # Prepare quantization config if specified
+        quant_config = None
+        if od_config.quantization == "nunchaku":
+            from vllm_omni.diffusion.layers.quantization.svdq_nunchaku import NunchakuConfig
+            
+            # Build quantization config from od_config
+            quant_params = od_config.quantization_config or {}
+            quant_config = NunchakuConfig(
+                rank=quant_params.get("rank", 32),
+                precision=quant_params.get("precision", "int4"),
+                act_unsigned=quant_params.get("act_unsigned", False),
+            )
+        
+        self.transformer = ZImageTransformer2DModel(quant_config=quant_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.vae_scale_factor = (

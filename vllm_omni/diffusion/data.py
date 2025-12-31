@@ -353,6 +353,26 @@ class OmniDiffusionConfig:
     # support multi images input
     supports_multimodal_inputs: bool = False
 
+    # Quantization configuration
+    quantization: str | None = None
+    """Quantization method to use. Supported: 'nunchaku' (SVDQuant W4A4)"""
+    
+    quantization_config: dict[str, Any] | None = None
+    """Quantization-specific configuration parameters.
+    
+    For Nunchaku SVDQuant, supports:
+        - rank: Low-rank dimension (default: 32)
+        - precision: 'int4' or 'nvfp4' (default: 'int4')
+        - act_unsigned: Use unsigned activation quantization (default: False)
+    
+    Example:
+        quantization_config = {
+            "rank": 32,
+            "precision": "nvfp4",
+            "act_unsigned": False,
+        }
+    """
+
     # Logging
     log_level: str = "info"
 

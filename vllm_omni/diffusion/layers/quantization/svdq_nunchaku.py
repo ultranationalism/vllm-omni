@@ -15,6 +15,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 try:
     from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
@@ -28,6 +32,83 @@ except ImportError:
     _NUNCHAKU_OPS_AVAILABLE = False
 
 
+# ============================================================================
+# Weight Packing and Padding Utilities
+# ============================================================================
+
+
+def pad_to_multiple(tensor: torch.Tensor, dim: int, multiple: int) -> torch.Tensor:
+    """Pad a tensor along a specific dimension to be a multiple of a value.
+    
+    Args:
+        tensor: Input tensor to pad
+        dim: Dimension to pad along
+        multiple: Target multiple for dimension size
+        
+    Returns:
+        Padded tensor
+    """
+    current_size = tensor.shape[dim]
+    if current_size % multiple == 0:
+        return tensor
+    
+    target_size = ((current_size + multiple - 1) // multiple) * multiple
+    pad_size = target_size - current_size
+    
+    # Create padding specification (right pad on the specified dimension)
+    pad_spec = [0, 0] * tensor.ndim
+    pad_spec[-(2 * dim + 1)] = pad_size
+    
+    return torch.nn.functional.pad(tensor, pad_spec, value=0)
+
+
+def pack_lowrank_weight(weight: torch.Tensor, down: bool = True) -> torch.Tensor:
+    """Pack low-rank projection weights for Nunchaku SVDQuant CUDA kernels.
+    
+    Nunchaku's CUDA kernels require low-rank matrices to follow a specific
+    memory layout for optimal performance. This function packs FP16/BF16
+    weights according to these requirements.
+    
+    Args:
+        weight: Low-rank weight tensor
+            - For down-projection: shape (in_features, rank)
+            - For up-projection: shape (out_features, rank)
+        down: True for down-projection, False for up-projection
+        
+    Returns:
+        Packed weight tensor with optimized memory layout
+    """
+    if down:
+        # Down-projection: (in_features, rank)
+        # Pack in column-major order with alignment
+        M, K = weight.shape
+        
+        # Ensure rank (K) is aligned to 16 for efficient memory access
+        if K % 16 != 0:
+            weight = pad_to_multiple(weight, dim=1, multiple=16)
+            K = weight.shape[1]
+        
+        # Transpose for column-major layout: (rank, in_features)
+        # This allows coalesced memory access in CUDA kernels
+        packed = weight.t().contiguous()
+        
+    else:
+        # Up-projection: (out_features, rank)
+        # Pack in row-major order but ensure proper alignment
+        N, K = weight.shape
+        
+        # Ensure rank (K) is aligned to 16
+        if K % 16 != 0:
+            weight = pad_to_multiple(weight, dim=1, multiple=16)
+            K = weight.shape[1]
+        
+        # Keep row-major but ensure contiguous memory
+        packed = weight.contiguous()
+    
+    return packed
+
+
+@register_quantization_config("nunchaku")
 class NunchakuConfig(QuantizationConfig):
     """Configuration for Nunchaku SVDQuant quantization.
     
@@ -164,6 +245,33 @@ class NunchakuLinearMethod(LinearMethodBase):
             for key, value in attrs.items():
                 setattr(param, key, value)
         
+        # Create custom weight loaders for proj_down and proj_up
+        # These will handle name mapping (lora_down/lora_up -> proj_down/proj_up)
+        # and weight packing for CUDA kernel requirements
+        def proj_down_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+            """Custom loader for proj_down that packs weights."""
+            # Pack for down-projection (transpose + pad)
+            packed_weight = pack_lowrank_weight(loaded_weight, down=True)
+            logger.debug(
+                "Packed proj_down weight: %s -> %s",
+                loaded_weight.shape,
+                packed_weight.shape,
+            )
+            # Use default loader for the packed weight
+            default_weight_loader(param, packed_weight)
+        
+        def proj_up_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+            """Custom loader for proj_up that packs weights."""
+            # Pack for up-projection (pad only)
+            packed_weight = pack_lowrank_weight(loaded_weight, down=False)
+            logger.debug(
+                "Packed proj_up weight: %s -> %s",
+                loaded_weight.shape,
+                packed_weight.shape,
+            )
+            # Use default loader for the packed weight
+            default_weight_loader(param, packed_weight)
+        
         # Quantized weight tensor (packed int4 -> int8)
         # Shape: (out_features, in_features // 2)
         qweight = nn.Parameter(
@@ -200,22 +308,22 @@ class NunchakuLinearMethod(LinearMethodBase):
         })
         
         # Low-rank projection matrices
-        # proj_down: (in_features, rank)
+        # proj_down: (in_features, rank) - will be packed to (rank, in_features)
         proj_down = nn.Parameter(
             torch.empty(
+                rank,  # After packing: rank becomes first dimension
                 input_size_per_partition,
-                rank,
                 dtype=params_dtype,
             ),
             requires_grad=False,
         )
         set_weight_attrs(proj_down, {
-            "input_dim": 0,
-            "output_dim": 1,
-            "weight_loader": default_weight_loader,
+            "input_dim": 1,  # After transpose: input_dim is dimension 1
+            "output_dim": 0,
+            "weight_loader": proj_down_loader,  # Use custom loader
         })
         
-        # proj_up: (out_features, rank)
+        # proj_up: (out_features, rank) - will be padded
         proj_up = nn.Parameter(
             torch.empty(
                 output_size_per_partition,
@@ -227,7 +335,7 @@ class NunchakuLinearMethod(LinearMethodBase):
         set_weight_attrs(proj_up, {
             "input_dim": 0,
             "output_dim": 1,
-            "weight_loader": default_weight_loader,
+            "weight_loader": proj_up_loader,  # Use custom loader
         })
         
         # Smooth factors for activation quantization
@@ -269,7 +377,7 @@ class NunchakuLinearMethod(LinearMethodBase):
             # Mark which dimension should be sharded for TP
             qweight.input_dim = 1
             wscales.input_dim = 0
-            proj_down.input_dim = 0
+            proj_down.input_dim = 1  # After transpose
             smooth_factor.input_dim = 0
             smooth_factor_orig.input_dim = 0
         
