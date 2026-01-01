@@ -110,7 +110,16 @@ class ZImageAttention(nn.Module):
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
         self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
-        self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+        self.to_out = nn.ModuleList([
+            RowParallelLinear(
+                dim,
+                dim,
+                bias=False,
+                disable_tp=True,
+                return_bias=False,
+                quant_config=quant_config,
+            )
+        ])
 
         self.attn = Attention(
             num_heads=num_heads,
@@ -167,9 +176,29 @@ class ZImageAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    """FeedForward module compatible with both standard and Nunchaku-quantized checkpoints.
+    
+    Structure:
+    - Standard checkpoint: w1.weight, w2.weight, w3.weight
+    - Nunchaku checkpoint: net.0.proj.qweight, net.2.qweight, etc.
+    
+    This implementation uses 'net' wrapper to match Nunchaku's structure.
+    """
     def __init__(self, dim: int, hidden_dim: int, quant_config: QuantizationConfig | None = None):
         super().__init__()
-        self.w13 = MergedColumnParallelLinear(
+        
+        # Wrapper class to provide .proj attribute for compatibility with Nunchaku checkpoints
+        # Nunchaku saves weights as net.0.proj.*, so we need this structure
+        class ProjWrapper(nn.Module):
+            def __init__(self, linear):
+                super().__init__()
+                self.proj = linear
+            
+            def forward(self, x):
+                return self.proj(x)
+        
+        # Create the merged w1+w3 layer (gate + up projections)
+        w13 = MergedColumnParallelLinear(
             dim,
             [hidden_dim] * 2,
             bias=False,
@@ -177,8 +206,9 @@ class FeedForward(nn.Module):
             return_bias=False,
             quant_config=quant_config,
         )
-        self.act = SiluAndMul()
-        self.w2 = RowParallelLinear(
+        
+        # Create w2 layer (down projection)
+        w2 = RowParallelLinear(
             hidden_dim,
             dim,
             bias=False,
@@ -186,9 +216,29 @@ class FeedForward(nn.Module):
             return_bias=False,
             quant_config=quant_config,
         )
+        
+        # Wrap layers in a ModuleList to match Nunchaku's structure:
+        # net[0] = ProjWrapper(w13) -> provides net.0.proj for weight loading
+        # net[1] = Identity (activation placeholder, not stored)
+        # net[2] = w2 -> provides net.2 for weight loading
+        self.net = nn.ModuleList([
+            ProjWrapper(w13),
+            nn.Identity(),  # Placeholder for activation
+            w2,
+        ])
+        
+        # Also keep direct references for easier access and standard checkpoint compatibility
+        # When loading standard checkpoint with w1.weight, w2.weight, w3.weight,
+        # these attributes allow the weight loader to find the correct modules
+        self.w1 = self.net[0].proj  # Points to the merged w13
+        self.w2 = self.net[2]       # Points to w2
+        self.w3 = self.net[0].proj  # Points to the merged w13 (same as w1)
+        
+        self.act = SiluAndMul()
 
     def forward(self, x):
-        return self.w2(self.act(self.w13(x)))
+        # net[0] is ProjWrapper(w13), net[2] is w2
+        return self.net[2](self.act(self.net[0](x)))
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -351,6 +401,15 @@ class RopeEmbedder:
 
 
 class ZImageTransformer2DModel(nn.Module):
+    # Mapping for stacked/merged modules that need special weight loading
+    # Format: {vllm_module_name: [hf_module_name1, hf_module_name2, ...]}
+    # This tells AutoWeightsLoader how to map HuggingFace checkpoint weights to vLLM modules
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],          # Attention QKV projection
+        "net.0.proj": ["w1", "w3"],                   # FeedForward: w1+w3 merged (standard checkpoint)
+        # Note: Nunchaku checkpoints use net.0.proj.* directly, no mapping needed
+    }
+    
     def __init__(
         self,
         all_patch_size=(2,),
@@ -676,33 +735,33 @@ class ZImageTransformer2DModel(nn.Module):
 
         return x, {}
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # self-attn
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
-            # ffn
-            (".w13", ".w1", 0),
-            (".w13", ".w3", 1),
-        ]
+    # def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    #     stacked_params_mapping = [
+    #         # (param_name, shard_name, shard_id)
+    #         # self-attn
+    #         (".to_qkv", ".to_q", "q"),
+    #         (".to_qkv", ".to_k", "k"),
+    #         (".to_qkv", ".to_v", "v"),
+    #         # ffn
+    #         (".w13", ".w1", 0),
+    #         (".w13", ".w3", 1),
+    #     ]
 
-        params_dict = dict(self.named_parameters())
+    #     params_dict = dict(self.named_parameters())
 
-        loaded_params = set[str]()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+    #     loaded_params = set[str]()
+    #     for name, loaded_weight in weights:
+    #         for param_name, weight_name, shard_id in stacked_params_mapping:
+    #             if weight_name not in name:
+    #                 continue
+    #             name = name.replace(weight_name, param_name)
+    #             param = params_dict[name]
+    #             weight_loader = param.weight_loader
+    #             weight_loader(param, loaded_weight, shard_id)
+    #             break
+    #         else:
+    #             param = params_dict[name]
+    #             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    #             weight_loader(param, loaded_weight)
+    #         loaded_params.add(name)
+    #     return loaded_params
