@@ -187,8 +187,16 @@ class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, quant_config: QuantizationConfig | None = None):
         super().__init__()
         
+        # Wrapper class to provide .proj attribute for Nunchaku checkpoint compatibility
+        class ProjWrapper(nn.Module):
+            def __init__(self, linear):
+                super().__init__()
+                self.proj = linear
+            
+            def forward(self, x):
+                return self.proj(x)
+        
         # Create the merged w1+w3 layer (gate + up projections)
-        # This is a single MergedColumnParallelLinear that handles both w1 and w3
         w13_merged = MergedColumnParallelLinear(
             dim,
             [hidden_dim] * 2,
@@ -208,34 +216,19 @@ class FeedForward(nn.Module):
             quant_config=quant_config,
         )
         
-        # Register as direct attributes for standard checkpoint compatibility
-        # AutoWeightsLoader will find these when loading w1/w2/w3 weights
-        self.w1 = w13_merged
-        self.w2 = w2_layer
-        self.w3 = w13_merged  # w3 shares the same layer as w1
-        
-        # Wrapper class to provide .proj attribute for Nunchaku checkpoint compatibility
-        class ProjWrapper(nn.Module):
-            def __init__(self, linear):
-                super().__init__()
-                self.proj = linear
-            
-            def forward(self, x):
-                return self.proj(x)
-        
-        # Also create nested structure for Nunchaku checkpoint compatibility
+        # Create nested structure for Nunchaku checkpoint compatibility
         # This allows loading weights from net.0.proj.* and net.2.*
         self.net = nn.ModuleList([
-            ProjWrapper(w13_merged),  # net[0].proj points to the same w13_merged
+            ProjWrapper(w13_merged),  # net[0].proj 
             nn.Identity(),             # net[1] placeholder
-            w2_layer,                  # net[2] points to the same w2_layer
+            w2_layer,                  # net[2]
         ])
         
         self.act = SiluAndMul()
 
     def forward(self, x):
-        # Use w1 (which is w13_merged) and w2 for forward pass
-        return self.w2(self.act(self.w1(x)))
+        # Use net structure for forward pass
+        return self.net[2](self.act(self.net[0](x)))
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -400,11 +393,9 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(nn.Module):
     # Mapping for stacked/merged modules that need special weight loading
     # Format: {vllm_module_name: [hf_module_name1, hf_module_name2, ...]}
-    # This tells AutoWeightsLoader how to map HuggingFace checkpoint weights to vLLM modules
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],          # Attention QKV projection
-        "w1": ["w1", "w3"],                           # FeedForward: w1+w3 merged (standard checkpoint)
-        "net.0.proj": ["w1", "w3"],                   # FeedForward: alternate path for nested structure
+        "net.0.proj": ["w1", "w3"],                   # FeedForward: w1+w3 merged to net.0.proj
     }
     
     def __init__(
@@ -732,33 +723,58 @@ class ZImageTransformer2DModel(nn.Module):
 
         return x, {}
 
-    # def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-    #     stacked_params_mapping = [
-    #         # (param_name, shard_name, shard_id)
-    #         # self-attn
-    #         (".to_qkv", ".to_q", "q"),
-    #         (".to_qkv", ".to_k", "k"),
-    #         (".to_qkv", ".to_v", "v"),
-    #         # ffn
-    #         (".w13", ".w1", 0),
-    #         (".w13", ".w3", 1),
-    #     ]
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Custom weight loader to handle both standard and Nunchaku checkpoint formats.
+        
+        Standard checkpoint: feed_forward.w1/w2/w3
+        Nunchaku checkpoint: feed_forward.net.0.proj/net.2
+        """
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            # self-attn
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            # ffn - standard checkpoint format (w1/w2/w3 -> net.0.proj/net.2)
+            (".net.0.proj", ".w1", 0),
+            (".net.0.proj", ".w3", 1),
+        ]
+        
+        # Additional path rewrites for standard checkpoint
+        # Maps standard paths to nested structure
+        path_rewrites = {
+            ".w2.": ".net.2.",  # feed_forward.w2.* -> feed_forward.net.2.*
+        }
 
-    #     params_dict = dict(self.named_parameters())
+        params_dict = dict(self.named_parameters())
 
-    #     loaded_params = set[str]()
-    #     for name, loaded_weight in weights:
-    #         for param_name, weight_name, shard_id in stacked_params_mapping:
-    #             if weight_name not in name:
-    #                 continue
-    #             name = name.replace(weight_name, param_name)
-    #             param = params_dict[name]
-    #             weight_loader = param.weight_loader
-    #             weight_loader(param, loaded_weight, shard_id)
-    #             break
-    #         else:
-    #             param = params_dict[name]
-    #             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-    #             weight_loader(param, loaded_weight)
-    #         loaded_params.add(name)
-    #     return loaded_params
+        loaded_params = set[str]()
+        for name, loaded_weight in weights:
+            original_name = name
+            
+            # Apply path rewrites first (for standard checkpoint)
+            for old_path, new_path in path_rewrites.items():
+                if old_path in name:
+                    name = name.replace(old_path, new_path)
+                    break
+            
+            # Then apply stacked params mapping
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
+                break
+            else:
+                # Direct loading (for Nunchaku checkpoint or other weights)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+        
+        return loaded_params
