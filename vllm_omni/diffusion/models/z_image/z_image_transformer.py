@@ -182,23 +182,14 @@ class FeedForward(nn.Module):
     - Standard checkpoint: w1.weight, w2.weight, w3.weight
     - Nunchaku checkpoint: net.0.proj.qweight, net.2.qweight, etc.
     
-    This implementation uses 'net' wrapper to match Nunchaku's structure.
+    This implementation maintains both flat (w1/w2/w3) and nested (net.*) structures.
     """
     def __init__(self, dim: int, hidden_dim: int, quant_config: QuantizationConfig | None = None):
         super().__init__()
         
-        # Wrapper class to provide .proj attribute for compatibility with Nunchaku checkpoints
-        # Nunchaku saves weights as net.0.proj.*, so we need this structure
-        class ProjWrapper(nn.Module):
-            def __init__(self, linear):
-                super().__init__()
-                self.proj = linear
-            
-            def forward(self, x):
-                return self.proj(x)
-        
         # Create the merged w1+w3 layer (gate + up projections)
-        w13 = MergedColumnParallelLinear(
+        # This is a single MergedColumnParallelLinear that handles both w1 and w3
+        w13_merged = MergedColumnParallelLinear(
             dim,
             [hidden_dim] * 2,
             bias=False,
@@ -208,7 +199,7 @@ class FeedForward(nn.Module):
         )
         
         # Create w2 layer (down projection)
-        w2 = RowParallelLinear(
+        w2_layer = RowParallelLinear(
             hidden_dim,
             dim,
             bias=False,
@@ -217,28 +208,34 @@ class FeedForward(nn.Module):
             quant_config=quant_config,
         )
         
-        # Wrap layers in a ModuleList to match Nunchaku's structure:
-        # net[0] = ProjWrapper(w13) -> provides net.0.proj for weight loading
-        # net[1] = Identity (activation placeholder, not stored)
-        # net[2] = w2 -> provides net.2 for weight loading
-        self.net = nn.ModuleList([
-            ProjWrapper(w13),
-            nn.Identity(),  # Placeholder for activation
-            w2,
-        ])
+        # Register as direct attributes for standard checkpoint compatibility
+        # AutoWeightsLoader will find these when loading w1/w2/w3 weights
+        self.w1 = w13_merged
+        self.w2 = w2_layer
+        self.w3 = w13_merged  # w3 shares the same layer as w1
         
-        # Also keep direct references for easier access and standard checkpoint compatibility
-        # When loading standard checkpoint with w1.weight, w2.weight, w3.weight,
-        # these attributes allow the weight loader to find the correct modules
-        self.w1 = self.net[0].proj  # Points to the merged w13
-        self.w2 = self.net[2]       # Points to w2
-        self.w3 = self.net[0].proj  # Points to the merged w13 (same as w1)
+        # Wrapper class to provide .proj attribute for Nunchaku checkpoint compatibility
+        class ProjWrapper(nn.Module):
+            def __init__(self, linear):
+                super().__init__()
+                self.proj = linear
+            
+            def forward(self, x):
+                return self.proj(x)
+        
+        # Also create nested structure for Nunchaku checkpoint compatibility
+        # This allows loading weights from net.0.proj.* and net.2.*
+        self.net = nn.ModuleList([
+            ProjWrapper(w13_merged),  # net[0].proj points to the same w13_merged
+            nn.Identity(),             # net[1] placeholder
+            w2_layer,                  # net[2] points to the same w2_layer
+        ])
         
         self.act = SiluAndMul()
 
     def forward(self, x):
-        # net[0] is ProjWrapper(w13), net[2] is w2
-        return self.net[2](self.act(self.net[0](x)))
+        # Use w1 (which is w13_merged) and w2 for forward pass
+        return self.w2(self.act(self.w1(x)))
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -406,8 +403,8 @@ class ZImageTransformer2DModel(nn.Module):
     # This tells AutoWeightsLoader how to map HuggingFace checkpoint weights to vLLM modules
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],          # Attention QKV projection
-        "net.0.proj": ["w1", "w3"],                   # FeedForward: w1+w3 merged (standard checkpoint)
-        # Note: Nunchaku checkpoints use net.0.proj.* directly, no mapping needed
+        "w1": ["w1", "w3"],                           # FeedForward: w1+w3 merged (standard checkpoint)
+        "net.0.proj": ["w1", "w3"],                   # FeedForward: alternate path for nested structure
     }
     
     def __init__(
