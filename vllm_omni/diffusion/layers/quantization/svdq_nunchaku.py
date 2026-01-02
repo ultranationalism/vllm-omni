@@ -205,19 +205,17 @@ class NunchakuLinearMethod(LinearMethodBase):
         self.quant_config = quant_config
     
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Process weights after loading from checkpoint.
+        """Extract alpha from checkpoint or use default for CUDA kernel.
         
-        This extracts the scalar alpha value from wtscale for use in forward pass.
-        If wtscale is not in checkpoint (default value 1.0), calculate it from wcscales.
+        Nunchaku's CUDA kernel computes: Output = (Accumulator × alpha) × wcscales
+        - If wtscale in checkpoint: use it as alpha
+        - Otherwise: use alpha=1.0, let wcscales handle per-channel scaling
         """
-        
-        # 1. Extract or calculate wtscale/alpha
         alpha: Optional[float] = None
-        wtscale_from_checkpoint = False
         
+        # Extract wtscale from checkpoint if available
         if hasattr(layer, "wtscale") and layer.wtscale is not None:
             wtscale = layer.wtscale
-            
             if isinstance(wtscale, Parameter):
                 wtscale_val = float(wtscale.data.detach().cpu().item())
             elif isinstance(wtscale, torch.Tensor):
@@ -225,10 +223,7 @@ class NunchakuLinearMethod(LinearMethodBase):
             else:
                 wtscale_val = float(wtscale)
             
-            logger.debug(f"wtscale value from parameter: {wtscale_val}")
-            
-            # Check if wtscale was actually loaded from checkpoint
-            # If it's still 1.0 (default value), it wasn't loaded
+            # Check if actually loaded from checkpoint (not default 1.0)
             if abs(wtscale_val - 1.0) > 1e-6:
                 alpha = wtscale_val
                 wtscale_from_checkpoint = True
@@ -243,16 +238,8 @@ class NunchakuLinearMethod(LinearMethodBase):
         # - But Nunchaku expects: Output = Acc × 1.0 × wcscales = Acc × wcscales (CORRECT)
         if alpha is None:
             alpha = 1.0
-            if hasattr(layer, "wcscales") and layer.wcscales is not None:
-                logger.debug(f"wtscale not in checkpoint, using alpha=1.0 (wcscales will handle per-channel scaling)")
-            else:
-                precision = getattr(layer, "precision", None)
-                if precision == "nvfp4":
-                    logger.warning(f"No wtscale or wcscales found for nvfp4 layer, using default alpha=1.0")
         
-        # Cache alpha for fast access in forward pass
         layer._nunchaku_alpha = alpha
-        logger.debug(f"Final alpha set to: {alpha}")
 
 
     def create_weights(

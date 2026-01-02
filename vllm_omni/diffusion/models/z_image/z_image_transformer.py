@@ -176,13 +176,9 @@ class ZImageAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """FeedForward module compatible with both standard and Nunchaku-quantized checkpoints.
+    """FeedForward with SwiGLU activation.
     
-    Structure:
-    - Standard checkpoint: w1.weight, w2.weight, w3.weight
-    - Nunchaku checkpoint: net.0.proj.qweight, net.2.qweight, etc.
-    
-    This implementation maintains both flat (w1/w2/w3) and nested (net.*) structures.
+    Supports both standard (w1/w2/w3) and Nunchaku (net.0.proj/net.2) checkpoint formats.
     """
     def __init__(self, dim: int, hidden_dim: int, quant_config: QuantizationConfig | None = None):
         super().__init__()
@@ -190,9 +186,7 @@ class FeedForward(nn.Module):
         # SiluAndMul activation (optimized CUDA kernel)
         self.act = SiluAndMul()
         
-        # Wrapper class to provide .proj attribute for Nunchaku checkpoint compatibility
-        # IMPORTANT: This wrapper includes activation to match Nunchaku's behavior
-        # where net[0] outputs post-activation values (shape: hidden_dim)
+        # Wrapper to provide .proj attribute for Nunchaku checkpoint compatibility
         class ProjWrapper(nn.Module):
             def __init__(self, linear, act_fn):
                 super().__init__()
@@ -200,17 +194,11 @@ class FeedForward(nn.Module):
                 self.act_fn = act_fn
             
             def forward(self, x):
-                # Apply SwiGLU activation to match Nunchaku's net[0] behavior
-                # Nunchaku: net[0] outputs hidden * silu(gate)
-                # vLLM SiluAndMul: computes silu(x[:d]) * x[d:]
-                # 
-                # Solution: Swap the two halves before passing to SiluAndMul
-                # proj outputs: [hidden, gate] (shape: [B, 2*hidden_dim])
-                # After swap: [gate, hidden]
-                # SiluAndMul computes: silu(gate) * hidden ✓
+                # SwiGLU: Swap halves to match Nunchaku's activation order
+                # vLLM's SiluAndMul computes silu(x[:d]) * x[d:]
+                # Nunchaku expects: x[:d] * silu(x[d:])
                 proj_out = self.proj(x)
                 d = proj_out.shape[-1] // 2
-                # Swap halves: [hidden, gate] -> [gate, hidden]
                 swapped = torch.cat([proj_out[..., d:], proj_out[..., :d]], dim=-1)
                 return self.act_fn(swapped)
         
@@ -243,7 +231,6 @@ class FeedForward(nn.Module):
         ])
 
     def forward(self, x):
-        # net[0] now outputs post-activation (hidden_dim), directly pass to net[2]
         return self.net[2](self.net[0](x))
 
 
@@ -406,15 +393,7 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
-class ZImageTransformer2DModel(nn.Module):
-    # Mapping for stacked/merged modules that need special weight loading
-    # Format: {vllm_module_name: [hf_module_name1, hf_module_name2, ...]}
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],          # Attention QKV projection
-        "net.0.proj": ["w1", "w3"],                   # FeedForward: w1+w3 merged to net.0.proj
-        "net.2": ["w2"],                              # FeedForward: w2 maps to net.2
-    }
-    
+class ZImageTransformer2DModel(nn.Module):    
     def __init__(
         self,
         all_patch_size=(2,),
