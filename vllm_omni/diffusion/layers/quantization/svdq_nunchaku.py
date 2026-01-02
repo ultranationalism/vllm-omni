@@ -207,21 +207,53 @@ class NunchakuLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process weights after loading from checkpoint.
         
-        This extracts the scalar alpha value from wtscale Parameter for use in forward pass.
+        This extracts the scalar alpha value from wtscale for use in forward pass.
+        If wtscale is not in checkpoint (default value 1.0), calculate it from wcscales.
         """
-        # Convert wtscale Parameter to scalar alpha value
+        
+        # 1. Extract or calculate wtscale/alpha
         alpha: Optional[float] = None
+        wtscale_from_checkpoint = False
+        
         if hasattr(layer, "wtscale") and layer.wtscale is not None:
             wtscale = layer.wtscale
+            
             if isinstance(wtscale, Parameter):
-                wtscale = wtscale.data
-            if isinstance(wtscale, torch.Tensor):
-                alpha = float(wtscale.detach().cpu().item())
+                wtscale_val = float(wtscale.data.detach().cpu().item())
+            elif isinstance(wtscale, torch.Tensor):
+                wtscale_val = float(wtscale.detach().cpu().item())
             else:
-                alpha = float(wtscale)
+                wtscale_val = float(wtscale)
+            
+            logger.debug(f"wtscale value from parameter: {wtscale_val}")
+            
+            # Check if wtscale was actually loaded from checkpoint
+            # If it's still 1.0 (default value), it wasn't loaded
+            if abs(wtscale_val - 1.0) > 1e-6:
+                alpha = wtscale_val
+                wtscale_from_checkpoint = True
+                logger.debug(f"Using wtscale from checkpoint: {alpha}")
+            else:
+                logger.debug(f"wtscale is default value 1.0, not from checkpoint")
         
-        # Store as cached attribute for fast access during forward
+        # 2. If wtscale not loaded, use alpha=1.0 and let wcscales handle scaling
+        # IMPORTANT: Do NOT calculate alpha from wcscales.mean() because:
+        # - Nunchaku kernel uses: Output = (Accumulator × alpha) × wcscales
+        # - If we set alpha=wcscales.mean(), we get: Output = Acc × mean(wcscales) × wcscales (WRONG!)
+        # - But Nunchaku expects: Output = Acc × 1.0 × wcscales = Acc × wcscales (CORRECT)
+        if alpha is None:
+            alpha = 1.0
+            if hasattr(layer, "wcscales") and layer.wcscales is not None:
+                logger.debug(f"wtscale not in checkpoint, using alpha=1.0 (wcscales will handle per-channel scaling)")
+            else:
+                precision = getattr(layer, "precision", None)
+                if precision == "nvfp4":
+                    logger.warning(f"No wtscale or wcscales found for nvfp4 layer, using default alpha=1.0")
+        
+        # Cache alpha for fast access in forward pass
         layer._nunchaku_alpha = alpha
+        logger.debug(f"Final alpha set to: {alpha}")
+
 
     def create_weights(
         self,
@@ -254,10 +286,12 @@ class NunchakuLinearMethod(LinearMethodBase):
         
         config = self.quant_config
         rank = config.rank
-        # Pad rank to multiple of 16 for CUDA kernel alignment
-        padded_rank = ((rank + 15) // 16) * 16
         precision = config.precision
         group_size = config.group_size
+        
+        # For W4A4 quantization, LoRA projections and smooth factors must use bfloat16
+        # for correct activation quantization (matching Nunchaku's implementation)
+        lora_dtype = torch.bfloat16 if precision == "nvfp4" else params_dtype
         
         # Helper function to set weight attributes
         def set_weight_attrs(param: nn.Parameter, attrs: Dict[str, Any]):
@@ -328,12 +362,12 @@ class NunchakuLinearMethod(LinearMethodBase):
         })
         
         # Low-rank projection matrices
-        # proj_down: (in_features, padded_rank) - rank padded to 16x for alignment
+        # proj_down: (in_features, rank) - will be padded by weight loader if needed
         proj_down = nn.Parameter(
             torch.empty(
                 input_size_per_partition,
-                padded_rank,
-                dtype=params_dtype,
+                rank,
+                dtype=lora_dtype,
             ),
             requires_grad=False,
         )
@@ -343,12 +377,12 @@ class NunchakuLinearMethod(LinearMethodBase):
             "weight_loader": proj_down_loader,  # Use custom loader
         })
         
-        # proj_up: (out_features, padded_rank) - rank padded to 16x for alignment
+        # proj_up: (out_features, rank) - will be padded by weight loader if needed
         proj_up = nn.Parameter(
             torch.empty(
                 output_size_per_partition,
-                padded_rank,
-                dtype=params_dtype,
+                rank,
+                dtype=lora_dtype,
             ),
             requires_grad=False,
         )
@@ -363,7 +397,7 @@ class NunchakuLinearMethod(LinearMethodBase):
         smooth_factor = nn.Parameter(
             torch.empty(
                 input_size_per_partition,
-                dtype=params_dtype,
+                dtype=lora_dtype,
             ),
             requires_grad=False,
         )
@@ -375,7 +409,7 @@ class NunchakuLinearMethod(LinearMethodBase):
         smooth_factor_orig = nn.Parameter(
             torch.empty(
                 input_size_per_partition,
-                dtype=params_dtype,
+                dtype=lora_dtype,
             ),
             requires_grad=False,
         )
@@ -411,10 +445,12 @@ class NunchakuLinearMethod(LinearMethodBase):
         
         # Optional parameters for nvfp4 precision
         if precision == "nvfp4":
+            # wcscales: per-channel scales, must match output dtype (bfloat16)
+            # NOT float8_e4m3fn like wscales!
             wcscales = nn.Parameter(
                 torch.ones(
                     output_size_per_partition,
-                    dtype=params_dtype,
+                    dtype=lora_dtype,  # Use lora_dtype (bfloat16) for consistency with output
                 ),
                 requires_grad=False,
             )
@@ -426,10 +462,10 @@ class NunchakuLinearMethod(LinearMethodBase):
                 wcscales.output_dim = 0
             layer.register_parameter("wcscales", wcscales)
             
-            # wtscale: scalar parameter for additional scaling
-            # If not in checkpoint, will remain as 1.0 (no additional scaling)
+            # wtscale: Global scale parameter, must match output dtype (bfloat16)
+            # Create as Parameter so it can be loaded from checkpoint
             wtscale = nn.Parameter(
-                torch.ones(1, dtype=params_dtype),
+                torch.ones(1, dtype=lora_dtype),  # Shape (1,) to match checkpoint
                 requires_grad=False,
             )
             set_weight_attrs(wtscale, {
@@ -448,26 +484,6 @@ class NunchakuLinearMethod(LinearMethodBase):
         layer.precision = precision
         layer.group_size = group_size
         layer.act_unsigned = config.act_unsigned
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Process weights after loading from checkpoint.
-        
-        This method extracts the scalar alpha value from wtscale parameter
-        and caches it as a float for efficient use in forward pass.
-        """
-        # Extract alpha (scalar multiplier) from wtscale if present
-        alpha: float | None = None
-        if hasattr(layer, "wtscale") and layer.wtscale is not None:
-            wtscale = layer.wtscale
-            if isinstance(wtscale, nn.Parameter):
-                wtscale = wtscale.data
-            if isinstance(wtscale, torch.Tensor):
-                alpha = float(wtscale.detach().cpu().item())
-            else:
-                alpha = float(wtscale)
-        
-        # Cache the alpha value for efficient forward pass
-        layer._nunchaku_alpha = alpha
 
     def apply(
         self,
@@ -497,21 +513,22 @@ class NunchakuLinearMethod(LinearMethodBase):
             fp4=layer.precision == "nvfp4",
             pad_size=256,
         )
-        
+                
         # Use per-partition output features (critical for TP correctness)
         out_features = layer.out_features_per_partition
         
-        # Allocate output buffer (kernel may pad batch, but we allocate for actual batch)
+        # IMPORTANT: Allocate output buffer using quantized_x.shape[0] (padded batch size)
+        # The quantization kernel may pad the batch dimension, so we must match that
         out_2d = torch.empty(
-            x_2d.shape[0],
+            quantized_x.shape[0],  # Use padded batch size from quantized_x
             out_features,
             dtype=layer.proj_up.dtype,
             device=x_2d.device,
         )
         
-        # Get alpha from cached attribute (set in process_weights_after_loading)
-        alpha: Optional[float] = getattr(layer, "_nunchaku_alpha", None)
-        wcscales = getattr(layer, "wcscales", None)
+        # Use cached alpha value (extracted in process_weights_after_loading)
+        alpha = getattr(layer, "_nunchaku_alpha", None)
+        wcscales = layer.wcscales if hasattr(layer, "wcscales") else None
         
         # Perform quantized GEMM with low-rank correction
         svdq_gemm_w4a4_cuda(
@@ -528,6 +545,13 @@ class NunchakuLinearMethod(LinearMethodBase):
             wcscales=wcscales,
             act_unsigned=layer.act_unsigned,
         )
+        
+        # Trim padding if batch was padded by quantization kernel
+        # out_2d might have shape (padded_batch, out_features)
+        # We need to trim it back to (actual_batch, out_features)
+        actual_batch = x_2d.shape[0]
+        if out_2d.shape[0] > actual_batch:
+            out_2d = out_2d[:actual_batch]
         
         # Reshape back to original shape (except last dimension)
         output = out_2d.reshape(*orig_shape[:-1], out_features)

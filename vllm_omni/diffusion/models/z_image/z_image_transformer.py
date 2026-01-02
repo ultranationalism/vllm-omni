@@ -187,14 +187,32 @@ class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, quant_config: QuantizationConfig | None = None):
         super().__init__()
         
+        # SiluAndMul activation (optimized CUDA kernel)
+        self.act = SiluAndMul()
+        
         # Wrapper class to provide .proj attribute for Nunchaku checkpoint compatibility
+        # IMPORTANT: This wrapper includes activation to match Nunchaku's behavior
+        # where net[0] outputs post-activation values (shape: hidden_dim)
         class ProjWrapper(nn.Module):
-            def __init__(self, linear):
+            def __init__(self, linear, act_fn):
                 super().__init__()
                 self.proj = linear
+                self.act_fn = act_fn
             
             def forward(self, x):
-                return self.proj(x)
+                # Apply SwiGLU activation to match Nunchaku's net[0] behavior
+                # Nunchaku: net[0] outputs hidden * silu(gate)
+                # vLLM SiluAndMul: computes silu(x[:d]) * x[d:]
+                # 
+                # Solution: Swap the two halves before passing to SiluAndMul
+                # proj outputs: [hidden, gate] (shape: [B, 2*hidden_dim])
+                # After swap: [gate, hidden]
+                # SiluAndMul computes: silu(gate) * hidden ✓
+                proj_out = self.proj(x)
+                d = proj_out.shape[-1] // 2
+                # Swap halves: [hidden, gate] -> [gate, hidden]
+                swapped = torch.cat([proj_out[..., d:], proj_out[..., :d]], dim=-1)
+                return self.act_fn(swapped)
         
         # Create the merged w1+w3 layer (gate + up projections)
         w13_merged = MergedColumnParallelLinear(
@@ -219,16 +237,14 @@ class FeedForward(nn.Module):
         # Create nested structure for Nunchaku checkpoint compatibility
         # This allows loading weights from net.0.proj.* and net.2.*
         self.net = nn.ModuleList([
-            ProjWrapper(w13_merged),  # net[0].proj 
-            nn.Identity(),             # net[1] placeholder
-            w2_layer,                  # net[2]
+            ProjWrapper(w13_merged, self.act),  # net[0].proj with SwiGLU activation
+            nn.Identity(),                       # net[1] placeholder
+            w2_layer,                            # net[2]
         ])
-        
-        self.act = SiluAndMul()
 
     def forward(self, x):
-        # Use net structure for forward pass
-        return self.net[2](self.act(self.net[0](x)))
+        # net[0] now outputs post-activation (hidden_dim), directly pass to net[2]
+        return self.net[2](self.net[0](x))
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -396,6 +412,7 @@ class ZImageTransformer2DModel(nn.Module):
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],          # Attention QKV projection
         "net.0.proj": ["w1", "w3"],                   # FeedForward: w1+w3 merged to net.0.proj
+        "net.2": ["w2"],                              # FeedForward: w2 maps to net.2
     }
     
     def __init__(
@@ -747,8 +764,8 @@ class ZImageTransformer2DModel(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
-
         loaded_params = set[str]()
+        
         for name, loaded_weight in weights:
             original_name = name
             
@@ -759,22 +776,36 @@ class ZImageTransformer2DModel(nn.Module):
                     break
             
             # Then apply stacked params mapping
+            # IMPORTANT: Only apply if the weight name EXACTLY matches (not just contains)
+            # to avoid false matches like "to_q" matching "to_qkv"
+            matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(name)
-                break
-            else:
+                # Check if weight_name appears as a module path component (e.g., ".to_q.", ".w1.")
+                # This avoids matching ".to_q" in ".to_qkv"
+                if weight_name + "." in name or name.endswith(weight_name):
+                    name = name.replace(weight_name, param_name)
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(name)
+                    matched = True
+                    break
+            
+            if not matched:
                 # Direct loading (for Nunchaku checkpoint or other weights)
                 if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+        
+        # Process weights after loading for quantized layers
+        # This is critical for extracting alpha and other quantization metadata
+        processed_count = 0
+        for name, module in self.named_modules():
+            if hasattr(module, "quant_method") and hasattr(module.quant_method, "process_weights_after_loading"):
+                module.quant_method.process_weights_after_loading(module)
+                processed_count += 1
         
         return loaded_params
