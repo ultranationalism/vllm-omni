@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# _sp_plan definition adapted from HuggingFace diffusers library (_cp_plan)
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -17,43 +18,217 @@
 
 import math
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
+
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.cache.base import CachedTransformer
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
+logger = init_logger(__name__)
+
+
+class UnifiedPrepare(nn.Module):
+    """Prepares unified tensors for transformer blocks.
+
+    This module encapsulates the unification of x and cap tensors into unified
+    sequences. Similar to how Wan's `rope` module outputs rotary embeddings,
+    this module outputs unified tensors that can be sharded via _sp_plan's
+    split_output=True mechanism.
+
+    This follows the diffusers pattern where tensor preparation happens in
+    a dedicated submodule, enabling _sp_plan hooks to work at module boundaries.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_cos: torch.Tensor,
+        x_sin: torch.Tensor,
+        cap_feats: torch.Tensor,
+        cap_cos: torch.Tensor,
+        cap_sin: torch.Tensor,
+        x_item_seqlens: list[int],
+        cap_item_seqlens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Combine x and cap tensors into unified sequences.
+
+        Returns:
+            unified: Combined hidden states [batch, seq_len, dim]
+            unified_cos: Combined RoPE cos [batch, seq_len, rope_dim]
+            unified_sin: Combined RoPE sin [batch, seq_len, rope_dim]
+            unified_attn_mask: Combined attention mask [batch, seq_len]
+        """
+        bsz = x.shape[0]
+        device = x.device
+
+        unified = []
+        unified_cos = []
+        unified_sin = []
+        for i in range(bsz):
+            x_len = x_item_seqlens[i]
+            cap_len = cap_item_seqlens[i]
+            unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
+            unified_cos.append(torch.cat([x_cos[i][:x_len], cap_cos[i][:cap_len]]))
+            unified_sin.append(torch.cat([x_sin[i][:x_len], cap_sin[i][:cap_len]]))
+
+        unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
+        unified_max_item_seqlen = max(unified_item_seqlens)
+
+        unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+        unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
+        unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
+        unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(unified_item_seqlens):
+            unified_attn_mask[i, :seq_len] = 1
+
+        return unified, unified_cos, unified_sin, unified_attn_mask
+
+
+def _positive_divisors(n: int) -> set[int]:
+    if n <= 0:
+        return set()
+    divs: set[int] = set()
+    for d in range(1, int(math.isqrt(n)) + 1):
+        if n % d == 0:
+            divs.add(d)
+            divs.add(n // d)
+    return divs
+
+
+def _get_tensor_parallel_size_from_context() -> int:
+    if not is_forward_context_available():
+        return 1
+    try:
+        od_config = get_forward_context().omni_diffusion_config
+        if od_config is None:
+            return 1
+        return int(od_config.parallel_config.tensor_parallel_size)
+    except Exception:
+        return 1
+
+
+def validate_zimage_tp_constraints(
+    *,
+    dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    in_channels: int,
+    all_patch_size: tuple[int, ...],
+    all_f_patch_size: tuple[int, ...],
+    tensor_parallel_size: int,
+) -> tuple[int, list[int], list[int]]:
+    """Validate Z-Image TP constraints without requiring a distributed context.
+
+    Returns:
+        (ffn_hidden_dim, final_out_dims, supported_tp_candidates)
+    """
+    tp_size = int(tensor_parallel_size)
+    if tp_size <= 0:
+        raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
+    if dim % n_heads != 0:
+        raise ValueError(f"dim must be divisible by n_heads, got dim={dim}, n_heads={n_heads}")
+    if dim % tp_size != 0:
+        supported = sorted(_positive_divisors(dim))
+        raise ValueError(
+            f"Z-Image requires dim % tensor_parallel_size == 0, but got dim={dim}, tp={tp_size}. "
+            f"Supported tp candidates by dim: {supported}"
+        )
+    if n_heads % tp_size != 0:
+        supported = sorted(_positive_divisors(n_heads))
+        raise ValueError(
+            f"Z-Image requires n_heads % tensor_parallel_size == 0, but got n_heads={n_heads}, tp={tp_size}. "
+            f"Supported tp candidates by n_heads: {supported}"
+        )
+    if n_kv_heads % tp_size != 0:
+        supported = sorted(_positive_divisors(n_kv_heads))
+        raise ValueError(
+            f"Z-Image requires n_kv_heads % tensor_parallel_size == 0, but got n_kv_heads={n_kv_heads}, "
+            f"tp={tp_size}. Supported tp candidates by n_kv_heads: {supported}"
+        )
+
+    ffn_hidden_dim = int(dim / 3 * 8)
+    if ffn_hidden_dim % tp_size != 0:
+        supported = sorted(_positive_divisors(ffn_hidden_dim))
+        raise ValueError(
+            "Z-Image requires ffn_hidden_dim % tensor_parallel_size == 0 (for TP-sharded MLP), but got "
+            f"ffn_hidden_dim={ffn_hidden_dim}, tp={tp_size}. Supported tp candidates by ffn_hidden_dim: {supported}"
+        )
+
+    final_out_dims = [
+        int(patch_size) * int(patch_size) * int(f_patch_size) * int(in_channels)
+        for patch_size, f_patch_size in zip(all_patch_size, all_f_patch_size)
+    ]
+    bad_final_out_dims = [d for d in final_out_dims if d % tp_size != 0]
+    if bad_final_out_dims:
+        supported = sorted(_positive_divisors(math.gcd(*final_out_dims)))
+        raise ValueError(
+            "Z-Image requires final projection out_features divisible by tensor_parallel_size, but got "
+            f"final_out_dims={final_out_dims}, tp={tp_size}. "
+            f"Supported tp candidates by final_out_dims gcd: {supported}"
+        )
+
+    supported_tp_candidates = sorted(
+        _positive_divisors(n_heads)
+        & _positive_divisors(n_kv_heads)
+        & _positive_divisors(dim)
+        & _positive_divisors(ffn_hidden_dim)
+        & _positive_divisors(math.gcd(*final_out_dims))
+    )
+    return ffn_hidden_dim, final_out_dims, supported_tp_candidates
+
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
+    def __init__(
+        self, out_size, mid_size=None, frequency_embedding_size=256, quant_config: "QuantizationConfig | None" = None
+    ):
         super().__init__()
         if mid_size is None:
             mid_size = out_size
         self.mlp = nn.Sequential(
-            nn.Linear(
+            ReplicatedLinear(
                 frequency_embedding_size,
                 mid_size,
                 bias=True,
+                quant_config=quant_config,
+                return_bias=False,
             ),
             nn.SiLU(),
-            nn.Linear(
+            ReplicatedLinear(
                 mid_size,
                 out_size,
                 bias=True,
+                quant_config=quant_config,
+                return_bias=False,
             ),
         )
 
@@ -73,7 +248,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        weight_dtype = self.mlp[0].weight.dtype
+        weight_dtype = self.mlp[0].bias.dtype
         if weight_dtype.is_floating_point:
             t_freq = t_freq.to(weight_dtype)
         t_emb = self.mlp(t_freq)
@@ -88,12 +263,12 @@ class ZImageAttention(nn.Module):
         num_kv_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-6,
-        quant_config: QuantizationConfig | None = None,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
@@ -101,7 +276,7 @@ class ZImageAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
-            disable_tp=True,
+            total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
         )
@@ -110,22 +285,28 @@ class ZImageAttention(nn.Module):
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
         self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
-        self.to_out = nn.ModuleList([
-            RowParallelLinear(
-                dim,
-                dim,
-                bias=False,
-                disable_tp=True,
-                return_bias=False,
-                quant_config=quant_config,
-            )
-        ])
+        # NOTE: QKV is column-parallel on heads, so attention output is sharded
+        # on the last dim (dim / tp). Use row-parallel output projection to
+        # all-reduce back to full dim.
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    bias=False,
+                    input_is_parallel=True,
+                    return_bias=False,
+                    quant_config=quant_config,
+                )
+            ]
+        )
 
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            num_kv_heads=self.to_qkv.num_kv_heads,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
 
@@ -137,19 +318,18 @@ class ZImageAttention(nn.Module):
         sin: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
-        query, key, value = qkv.chunk(3, dim=-1)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = query.unflatten(-1, (self.num_heads, -1))
-        key = key.unflatten(-1, (self.num_heads, -1))
-        value = value.unflatten(-1, (self.num_heads, -1))
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        cos = cos.to(query.dtype)
-        sin = sin.to(query.dtype)
-        query = self.rope(query, cos, sin)
-        key = self.rope(key, cos, sin)
+        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -176,62 +356,32 @@ class ZImageAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """FeedForward with SwiGLU activation.
-    
-    Supports both standard (w1/w2/w3) and Nunchaku (net.0.proj/net.2) checkpoint formats.
-    """
-    def __init__(self, dim: int, hidden_dim: int, quant_config: QuantizationConfig | None = None):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        quant_config: "QuantizationConfig | None" = None,
+    ):
         super().__init__()
-        
-        # SiluAndMul activation (optimized CUDA kernel)
-        self.act = SiluAndMul()
-        
-        # Wrapper to provide .proj attribute for Nunchaku checkpoint compatibility
-        class ProjWrapper(nn.Module):
-            def __init__(self, linear, act_fn):
-                super().__init__()
-                self.proj = linear
-                self.act_fn = act_fn
-            
-            def forward(self, x):
-                # SwiGLU: Swap halves to match Nunchaku's activation order
-                # vLLM's SiluAndMul computes silu(x[:d]) * x[d:]
-                # Nunchaku expects: x[:d] * silu(x[d:])
-                proj_out = self.proj(x)
-                d = proj_out.shape[-1] // 2
-                swapped = torch.cat([proj_out[..., d:], proj_out[..., :d]], dim=-1)
-                return self.act_fn(swapped)
-        
-        # Create the merged w1+w3 layer (gate + up projections)
-        w13_merged = MergedColumnParallelLinear(
+        self.w13 = MergedColumnParallelLinear(
             dim,
             [hidden_dim] * 2,
             bias=False,
-            disable_tp=True,
             return_bias=False,
             quant_config=quant_config,
         )
-        
-        # Create w2 layer (down projection)
-        w2_layer = RowParallelLinear(
+        self.act = SiluAndMul()
+        self.w2 = RowParallelLinear(
             hidden_dim,
             dim,
             bias=False,
-            disable_tp=True,
+            input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
         )
-        
-        # Create nested structure for Nunchaku checkpoint compatibility
-        # This allows loading weights from net.0.proj.* and net.2.*
-        self.net = nn.ModuleList([
-            ProjWrapper(w13_merged, self.act),  # net[0].proj with SwiGLU activation
-            nn.Identity(),                       # net[1] placeholder
-            w2_layer,                            # net[2]
-        ])
 
     def forward(self, x):
-        return self.net[2](self.net[0](x))
+        return self.w2(self.act(self.w13(x)))
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -244,7 +394,7 @@ class ZImageTransformerBlock(nn.Module):
         norm_eps: float,
         qk_norm: bool,
         modulation=True,
-        quant_config: QuantizationConfig | None = None,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.dim = dim
@@ -258,7 +408,11 @@ class ZImageTransformerBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8), quant_config=quant_config)
+        self.feed_forward = FeedForward(
+            dim=dim,
+            hidden_dim=int(dim / 3 * 8),
+            quant_config=quant_config,
+        )
         self.layer_id = layer_id
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -270,7 +424,9 @@ class ZImageTransformerBlock(nn.Module):
         self.modulation = modulation
         if modulation:
             self.adaLN_modulation = nn.Sequential(
-                nn.Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True),
+                ReplicatedLinear(
+                    min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True, return_bias=False, quant_config=quant_config
+                ),
             )
 
     def forward(
@@ -323,14 +479,18 @@ class ZImageTransformerBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, out_channels):
+    def __init__(self, hidden_size, out_channels, quant_config: "QuantizationConfig | None" = None):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, out_channels, bias=True)
+        self.linear = ReplicatedLinear(
+            hidden_size, out_channels, bias=True, quant_config=quant_config, return_bias=False
+        )
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True),
+            ReplicatedLinear(
+                min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True, quant_config=quant_config, return_bias=False
+            ),
         )
 
     def forward(self, x, c):
@@ -393,7 +553,53 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
-class ZImageTransformer2DModel(nn.Module):    
+class ZImageTransformer2DModel(CachedTransformer):
+    """Z-Image Transformer model for image generation.
+
+    Sequence Parallelism:
+        This model supports non-intrusive SP via _sp_plan. The plan specifies:
+        - Input splitting at first main transformer block (unified sequence)
+        - RoPE (cos/sin) splitting along sequence dimension
+        - Attention mask splitting along sequence dimension
+        - Output gathering at final_layer
+
+        The SP is applied to the main `layers` transformer blocks where the
+        unified image+caption sequence is processed jointly.
+
+        Note: noise_refiner and context_refiner are NOT parallelized as they
+        process image and caption separately before unification.
+
+        Important: The default _sp_plan assumes patch_size=2 and f_patch_size=1.
+        If using different patch configurations, update _sp_plan accordingly.
+
+        Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+    """
+
+    _repeated_blocks = ["ZImageTransformerBlock"]
+
+    # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
+    # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
+    # Z-Image uses `unified_prepare` module's split_output to shard unified tensors.
+    #
+    # The _sp_plan specifies sharding/gathering at module boundaries:
+    # - unified_prepare: Split all 4 outputs (unified, cos, sin, attn_mask) via split_output=True
+    # - layers.0: hidden_states input is already sharded from unified_prepare output
+    # - all_final_layer.2-1: Gather outputs after the final layer
+    #
+    # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
+    _sp_plan = {
+        # Shard unified_prepare outputs (similar to Wan's rope module)
+        # This shards all 4 return values: unified, unified_cos, unified_sin, unified_attn_mask
+        "unified_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_cos
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_sin
+            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True),  # unified_attn_mask
+        },
+        # Gather output at final_layer (default: patch_size=2, f_patch_size=1)
+        "all_final_layer.2-1": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
     def __init__(
         self,
         all_patch_size=(2,),
@@ -411,10 +617,9 @@ class ZImageTransformer2DModel(nn.Module):
         t_scale=1000.0,
         axes_dims=[32, 48, 48],
         axes_lens=[1024, 512, 512],
-        quant_config: QuantizationConfig | None = None,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
-        self.dtype = torch.bfloat16
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.all_patch_size = all_patch_size
@@ -428,13 +633,43 @@ class ZImageTransformer2DModel(nn.Module):
 
         assert len(all_patch_size) == len(all_f_patch_size)
 
+        tp_size = _get_tensor_parallel_size_from_context()
+        ffn_hidden_dim, final_out_dims, supported_tp_candidates = validate_zimage_tp_constraints(
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            in_channels=self.out_channels,
+            all_patch_size=tuple(all_patch_size),
+            all_f_patch_size=tuple(all_f_patch_size),
+            tensor_parallel_size=tp_size,
+        )
+
+        logger.info_once(
+            "Z-Image init: dim=%d n_heads=%d n_kv_heads=%d ffn_hidden_dim=%d final_out_dims=%s tp=%d (supported_tp=%s)",
+            dim,
+            n_heads,
+            n_kv_heads,
+            ffn_hidden_dim,
+            tuple(final_out_dims),
+            tp_size,
+            tuple(supported_tp_candidates),
+        )
+
         all_x_embedder = {}
         all_final_layer = {}
         for patch_idx, (patch_size, f_patch_size) in enumerate(zip(all_patch_size, all_f_patch_size)):
-            x_embedder = nn.Linear(f_patch_size * patch_size * patch_size * in_channels, dim, bias=True)
+            x_embedder = ReplicatedLinear(
+                f_patch_size * patch_size * patch_size * in_channels,
+                dim,
+                bias=True,
+                quant_config=quant_config,
+                return_bias=False,
+            )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
 
-            final_layer = FinalLayer(dim, patch_size * patch_size * f_patch_size * self.out_channels)
+            final_layer = FinalLayer(
+                dim, patch_size * patch_size * f_patch_size * self.out_channels, quant_config=quant_config
+            )
             all_final_layer[f"{patch_size}-{f_patch_size}"] = final_layer
 
         self.all_x_embedder = nn.ModuleDict(all_x_embedder)
@@ -469,10 +704,10 @@ class ZImageTransformer2DModel(nn.Module):
                 for layer_id in range(n_refiner_layers)
             ]
         )
-        self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024)
+        self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024, quant_config=quant_config)
         self.cap_embedder = nn.Sequential(
             RMSNorm(cap_feat_dim, eps=norm_eps),
-            nn.Linear(cap_feat_dim, dim, bias=True),
+            ReplicatedLinear(cap_feat_dim, dim, bias=True, return_bias=False, quant_config=quant_config),
         )
 
         self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
@@ -480,7 +715,15 @@ class ZImageTransformer2DModel(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                ZImageTransformerBlock(layer_id, dim, n_heads, n_kv_heads, norm_eps, qk_norm, quant_config=quant_config)
+                ZImageTransformerBlock(
+                    layer_id,
+                    dim,
+                    n_heads,
+                    n_kv_heads,
+                    norm_eps,
+                    qk_norm,
+                    quant_config=quant_config,
+                )
                 for layer_id in range(n_layers)
             ]
         )
@@ -488,6 +731,11 @@ class ZImageTransformer2DModel(nn.Module):
         self.axes_lens = axes_lens
 
         self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
+
+        # UnifiedPrepare module for combining x and cap tensors
+        # This enables _cp_plan to shard outputs via split_output=True
+        # Similar to how Wan's rope module enables rotary embedding sharding
+        self.unified_prepare = UnifiedPrepare()
 
     def unpatchify(self, x: list[torch.Tensor], size: list[tuple], patch_size, f_patch_size) -> list[torch.Tensor]:
         pH = pW = patch_size
@@ -650,7 +898,13 @@ class ZImageTransformer2DModel(nn.Module):
 
         # Match t_embedder output dtype to x for layerwise casting compatibility
         adaln_input = t.type_as(x)
-        x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
+        # Use torch.where instead of x[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
+        x_pad_mask = torch.cat(x_inner_pad_mask)
+        x = torch.where(
+            x_pad_mask.unsqueeze(1).expand_as(x),
+            self.x_pad_token.expand(x.shape[0], -1),
+            x,
+        )
         x = list(x.split(x_item_seqlens, dim=0))
         x_cos, x_sin = self.rope_embedder(torch.cat(x_pos_ids, dim=0))
         x_cos = list(x_cos.split(x_item_seqlens, dim=0))
@@ -673,7 +927,13 @@ class ZImageTransformer2DModel(nn.Module):
 
         cap_feats = torch.cat(cap_feats, dim=0)
         cap_feats = self.cap_embedder(cap_feats)
-        cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
+        # Use torch.where instead of cap_feats[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
+        cap_pad_mask = torch.cat(cap_inner_pad_mask)
+        cap_feats = torch.where(
+            cap_pad_mask.unsqueeze(1).expand_as(cap_feats),
+            self.cap_pad_token.expand(cap_feats.shape[0], -1),
+            cap_feats,
+        )
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
         cap_cos, cap_sin = self.rope_embedder(torch.cat(cap_pos_ids, dim=0))
         cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))
@@ -689,102 +949,82 @@ class ZImageTransformer2DModel(nn.Module):
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
 
-        # unified
-        unified = []
-        unified_cos = []
-        unified_sin = []
-        for i in range(bsz):
-            x_len = x_item_seqlens[i]
-            cap_len = cap_item_seqlens[i]
-            unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
-            unified_cos.append(torch.cat([x_cos[i][:x_len], cap_cos[i][:cap_len]]))
-            unified_sin.append(torch.cat([x_sin[i][:x_len], cap_sin[i][:cap_len]]))
-        unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
-        assert unified_item_seqlens == [len(_) for _ in unified]
-        unified_max_item_seqlen = max(unified_item_seqlens)
+        # Prepare unified tensors via UnifiedPrepare module
+        # This enables _cp_plan to shard outputs via split_output=True
+        unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
+            x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
+        )
 
-        unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
-        unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
-        unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
-        unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(unified_item_seqlens):
-            unified_attn_mask[i, :seq_len] = 1
-
+        # Main transformer blocks
         for layer in self.layers:
             unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
 
+        # Final layer
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
+
         unified = list(unified.unbind(dim=0))
         x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
 
         return x, {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Custom weight loader to handle both standard and Nunchaku checkpoint formats.
-        
-        Standard checkpoint: feed_forward.w1/w2/w3
-        Nunchaku checkpoint: feed_forward.net.0.proj/net.2
-        """
+        # Standard checkpoint stacked params mapping
+        # NOTE: use trailing dots to avoid substring collisions
+        # (e.g. ".w1." must NOT match ".w13.")
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self-attn
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
-            # ffn - standard checkpoint format (w1/w2/w3 -> net.0.proj/net.2)
-            (".net.0.proj", ".w1", 0),
-            (".net.0.proj", ".w3", 1),
+            (".to_qkv.", ".to_q.", "q"),
+            (".to_qkv.", ".to_k.", "k"),
+            (".to_qkv.", ".to_v.", "v"),
+            # ffn
+            (".w13.", ".w1.", 0),
+            (".w13.", ".w3.", 1),
         ]
-        
-        # Additional path rewrites for standard checkpoint
-        # Maps standard paths to nested structure
-        path_rewrites = {
-            ".w2.": ".net.2.",  # feed_forward.w2.* -> feed_forward.net.2.*
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
+
+        # Nunchaku (diffusers-style) checkpoint key remapping:
+        #   net.0.proj.* -> w13.*  (merged gate+up projection)
+        #   net.2.*      -> w2.*   (down projection)
+        nunchaku_path_rewrites = {
+            ".net.0.proj.": ".w13.",
+            ".net.2.": ".w2.",
         }
 
         params_dict = dict(self.named_parameters())
+
         loaded_params = set[str]()
-        
         for name, loaded_weight in weights:
-            original_name = name
-            
-            # Apply path rewrites first (for standard checkpoint)
-            for old_path, new_path in path_rewrites.items():
+            # Apply Nunchaku key remapping if applicable
+            for old_path, new_path in nunchaku_path_rewrites.items():
                 if old_path in name:
                     name = name.replace(old_path, new_path)
                     break
-            
-            # Then apply stacked params mapping
-            # IMPORTANT: Only apply if the weight name EXACTLY matches (not just contains)
-            # to avoid false matches like "to_q" matching "to_qkv"
+
+            # Try stacked params mapping (for standard checkpoints with
+            # separate to_q/to_k/to_v and w1/w3 weights).
+            # Quantized checkpoints (e.g. Nunchaku) may already have merged
+            # weights (to_qkv, w13) so these mappings won't match — the
+            # weight falls through to direct loading below.
             matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Check if weight_name appears as a module path component (e.g., ".to_q.", ".w1.")
-                # This avoids matching ".to_q" in ".to_qkv"
-                if weight_name + "." in name or name.endswith(weight_name):
-                    name = name.replace(weight_name, param_name)
-                    if name in params_dict:
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        weight_loader(param, loaded_weight, shard_id)
-                        loaded_params.add(name)
-                    matched = True
-                    break
-            
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
+                matched = True
+                break
+
             if not matched:
-                # Direct loading (for Nunchaku checkpoint or other weights)
                 if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
-        
-        # Process weights after loading for quantized layers
-        # This is critical for extracting alpha and other quantization metadata
-        processed_count = 0
-        for name, module in self.named_modules():
-            if hasattr(module, "quant_method") and hasattr(module.quant_method, "process_weights_after_loading"):
-                module.quant_method.process_weights_after_loading(module)
-                processed_count += 1
-        
+
         return loaded_params

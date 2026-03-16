@@ -6,16 +6,6 @@ from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-# Modify OpenAI's API key and API base to use vLLM's API server.
-openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8091/v1"
-
-client = OpenAI(
-    # defaults to os.environ.get("OPENAI_API_KEY")
-    api_key=openai_api_key,
-    base_url=openai_api_base,
-)
-
 SEED = 42
 
 
@@ -276,7 +266,7 @@ query_map = {
 }
 
 
-def run_multimodal_generation(args) -> None:
+def run_multimodal_generation(args, client: OpenAI) -> None:
     model_name = "Qwen/Qwen2.5-Omni-7B"
     thinker_sampling_params = {
         "temperature": 0.0,  # Deterministic - no randomness
@@ -354,19 +344,43 @@ def run_multimodal_generation(args) -> None:
         model=model_name,
         modalities=output_modalities,
         extra_body=extra_body,
+        stream=args.stream,
     )
 
     count = 0
-    for choice in chat_completion.choices:
-        if choice.message.audio:
-            audio_data = base64.b64decode(choice.message.audio.data)
-            audio_file_path = f"audio_{count}.wav"
-            with open(audio_file_path, "wb") as f:
-                f.write(audio_data)
-            print(f"Audio saved to {audio_file_path}")
-            count += 1
-        elif choice.message.content:
-            print("Chat completion output from text:", choice.message.content)
+    if not args.stream:
+        for choice in chat_completion.choices:
+            if choice.message.audio:
+                audio_data = base64.b64decode(choice.message.audio.data)
+                audio_file_path = f"audio_{count}.wav"
+                with open(audio_file_path, "wb") as f:
+                    f.write(audio_data)
+                print(f"Audio saved to {audio_file_path}")
+                count += 1
+            elif choice.message.content:
+                print("Chat completion output from text:", choice.message.content)
+    else:
+        printed_content = False
+        for chunk in chat_completion:
+            for choice in chunk.choices:
+                if hasattr(choice, "delta"):
+                    content = getattr(choice.delta, "content", None)
+                else:
+                    content = None
+
+                if getattr(chunk, "modality", None) == "audio" and content:
+                    audio_data = base64.b64decode(content)
+                    audio_file_path = f"audio_{count}.wav"
+                    with open(audio_file_path, "wb") as f:
+                        f.write(audio_data)
+                    print(f"\nAudio saved to {audio_file_path}")
+                    count += 1
+
+                elif getattr(chunk, "modality", None) == "text":
+                    if not printed_content:
+                        printed_content = True
+                        print("\ncontent:", end="", flush=True)
+                    print(content, end="", flush=True)
 
 
 def parse_args():
@@ -413,10 +427,33 @@ def parse_args():
         default=None,
         help="Output modalities to use for the prompts.",
     )
-
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream the response.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8091,
+        help="Port of the vLLM Omni API server.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host/IP of the vLLM Omni API server.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_multimodal_generation(args)
+    host = args.host
+    port = args.port
+    openai_api_base = f"http://{host}:{port}/v1"
+    client = OpenAI(
+        api_key="EMPTY",
+        base_url=openai_api_base,
+    )
+    run_multimodal_generation(args, client)

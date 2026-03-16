@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import os
 from typing import NamedTuple
 
@@ -6,16 +7,6 @@ import requests
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-# Modify OpenAI's API key and API base to use vLLM's API server.
-openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8091/v1"
-
-client = OpenAI(
-    # defaults to os.environ.get("OPENAI_API_KEY")
-    api_key=openai_api_key,
-    base_url=openai_api_base,
-)
 
 SEED = 42
 
@@ -254,15 +245,94 @@ def get_audio_query(audio_path: str | None = None, custom_prompt: str | None = N
     return prompt
 
 
+def get_mixed_modalities_query(
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    custom_prompt: str | None = None,
+):
+    """
+    Online-friendly multimodal user message:
+    - Uses URLs (or base64 data URLs) for audio / image / video.
+    - Returns the OpenAI-style message dict directly (not the offline QueryResult).
+    """
+    question = (
+        custom_prompt or "What is recited in the audio? What is the content of this image? Why is this video funny?"
+    )
+
+    audio_url = get_audio_url_from_path(audio_path)
+    image_url = get_image_url_from_path(image_path)
+    video_url = get_video_url_from_path(video_path)
+
+    return {
+        "role": "user",
+        "content": [
+            {"type": "audio_url", "audio_url": {"url": audio_url}},
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "video_url", "video_url": {"url": video_url}},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
+def get_multi_audios_query(custom_prompt: str | None = None):
+    """
+    Online-friendly two-audio comparison request.
+    - Encodes both audio clips as URLs (or data URLs).
+    - Returns the OpenAI-style message dict.
+    """
+    question = custom_prompt or "Are these two audio clips the same?"
+    # Use default demo clips; you can point to your own via --audio-path if needed.
+    audio_url_1 = get_audio_url_from_path(AudioAsset("winning_call").url)
+    audio_url_2 = get_audio_url_from_path(AudioAsset("mary_had_lamb").url)
+
+    return {
+        "role": "user",
+        "content": [
+            {"type": "audio_url", "audio_url": {"url": audio_url_1}},
+            {"type": "audio_url", "audio_url": {"url": audio_url_2}},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
+def get_use_audio_in_video_query(
+    video_path: str | None = None,
+    custom_prompt: str | None = None,
+):
+    """Query for use_audio_in_video mode.
+
+    When use_audio_in_video=True, audio is automatically extracted from the video
+    by the server. Do NOT send a separate audio_url - this would cause a mismatch
+    between the number of audio and video items.
+    """
+    question = custom_prompt or (
+        "Describe the content of the video in details, then convert what the baby say into text."
+    )
+    video_url = get_video_url_from_path(video_path)
+    # Note: audio is extracted from video automatically when use_audio_in_video=True
+    # Do not include a separate audio_url here
+    return {
+        "role": "user",
+        "content": [
+            {"type": "video_url", "video_url": {"url": video_url}},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
 query_map = {
     "text": get_text_query,
     "use_audio": get_audio_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
+    "use_mixed_modalities": get_mixed_modalities_query,
+    "use_multi_audios": get_multi_audios_query,
+    "use_audio_in_video": get_use_audio_in_video_query,
 }
 
 
-def run_multimodal_generation(args) -> None:
+def run_multimodal_generation(args, client: OpenAI) -> None:
     model_name = args.model
     thinker_sampling_params = {
         "temperature": 0.4,  # Deterministic
@@ -319,6 +389,11 @@ def run_multimodal_generation(args) -> None:
         prompt = query_func(audio_path=audio_path, custom_prompt=custom_prompt)
     elif args.query_type == "text":
         prompt = query_func(custom_prompt=custom_prompt)
+    elif args.query_type == "use_audio_in_video":
+        prompt = query_func(
+            video_path=video_path,
+            custom_prompt=custom_prompt,
+        )
     else:
         prompt = query_func()
 
@@ -334,27 +409,67 @@ def run_multimodal_generation(args) -> None:
     else:
         output_modalities = None
 
-    chat_completion = client.chat.completions.create(
-        messages=[
-            get_system_prompt(),
-            prompt,
-        ],
-        model=model_name,
-        modalities=output_modalities,
-        extra_body=extra_body,
-    )
+    # Test multiple concurrent completions
+    num_concurrent_requests = args.num_concurrent_requests
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+        # Submit multiple completion requests concurrently
+        futures = [
+            executor.submit(
+                client.chat.completions.create,
+                messages=[
+                    get_system_prompt(),
+                    prompt,
+                ],
+                model=model_name,
+                modalities=output_modalities,
+                extra_body=extra_body,
+                stream=args.stream,
+            )
+            for _ in range(num_concurrent_requests)
+        ]
+
+        # Wait for all requests to complete and collect results
+        chat_completions = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+    assert len(chat_completions) == num_concurrent_requests
     count = 0
-    for choice in chat_completion.choices:
-        if choice.message.audio:
-            audio_data = base64.b64decode(choice.message.audio.data)
-            audio_file_path = f"audio_{count}.wav"
-            with open(audio_file_path, "wb") as f:
-                f.write(audio_data)
-            print(f"Audio saved to {audio_file_path}")
-            count += 1
-        elif choice.message.content:
-            print("Chat completion output from text:", choice.message.content)
+    if not args.stream:
+        # Verify all completions succeeded
+        for chat_completion in chat_completions:
+            for choice in chat_completion.choices:
+                if choice.message.audio:
+                    audio_data = base64.b64decode(choice.message.audio.data)
+                    audio_file_path = f"audio_{count}.wav"
+                    with open(audio_file_path, "wb") as f:
+                        f.write(audio_data)
+                    print(f"Audio saved to {audio_file_path}")
+                    count += 1
+                elif choice.message.content:
+                    print("Chat completion output from text:", choice.message.content)
+    else:
+        printed_content = False
+        for chat_completion in chat_completions:
+            for chunk in chat_completion:
+                for choice in chunk.choices:
+                    if hasattr(choice, "delta"):
+                        content = getattr(choice.delta, "content", None)
+                    else:
+                        content = None
+
+                    if getattr(chunk, "modality", None) == "audio" and content:
+                        audio_data = base64.b64decode(content)
+                        audio_file_path = f"audio_{count}.wav"
+                        with open(audio_file_path, "wb") as f:
+                            f.write(audio_data)
+                        print(f"\nAudio saved to {audio_file_path}")
+                        count += 1
+
+                    elif getattr(chunk, "modality", None) == "text":
+                        if not printed_content:
+                            printed_content = True
+                            print("\ncontent:", end="", flush=True)
+                        print(content, end="", flush=True)
 
 
 def parse_args():
@@ -363,7 +478,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="use_video",
+        default="use_audio_in_video",
         choices=query_map.keys(),
         help="Query type.",
     )
@@ -408,10 +523,39 @@ def parse_args():
         default=None,
         help="Output modalities to use for the prompts.",
     )
-
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream the response.",
+    )
+    parser.add_argument(
+        "--num-concurrent-requests",
+        type=int,
+        default=1,
+        help="Number of concurrent requests to send. Default is 1.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8091,
+        help="Port of the vLLM Omni API server.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host/IP of the vLLM Omni API server.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_multimodal_generation(args)
+    host = args.host
+    port = args.port
+    openai_api_base = f"http://{host}:{port}/v1"
+    client = OpenAI(
+        api_key="EMPTY",
+        base_url=openai_api_base,
+    )
+    run_multimodal_generation(args, client)

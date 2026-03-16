@@ -10,7 +10,14 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -179,14 +186,38 @@ class NunchakuConfig(QuantizationConfig):
             act_unsigned=act_unsigned,
         )
 
+    # Layers that Nunchaku quantizes: attention (to_qkv, to_out) and
+    # feed_forward (net.0.proj / w13, net.2 / w2) in transformer blocks
+    # (layers, noise_refiner, context_refiner).
+    # Everything else (t_embedder, cap_embedder, all_x_embedder,
+    # all_final_layer, adaLN_modulation) stays unquantized.
+    _QUANTIZED_LAYER_PATTERNS = (
+        ".attention.to_qkv",
+        ".attention.to_out.",
+        ".feed_forward.w13",
+        ".feed_forward.w2",
+        ".feed_forward.net.0.proj",
+        ".feed_forward.net.2",
+    )
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["NunchakuLinearMethod"]:
-        """Get the quantization method for a layer."""
+        """Get the quantization method for a layer.
+
+        Only quantizes attention projections and FFN layers in transformer
+        blocks, matching Nunchaku's PTQ scope.
+        """
         if isinstance(layer, LinearBase):
-            return NunchakuLinearMethod(self)
+            # Nunchaku quantizes attention (QKVParallelLinear, RowParallelLinear)
+            # and FFN (MergedColumnParallelLinear, RowParallelLinear) layers.
+            # ReplicatedLinear layers (adaLN, embedders, final_layer) stay
+            # unquantized — they use standard weight/bias from checkpoint.
+            if isinstance(layer, (QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear)):
+                return NunchakuLinearMethod(self)
+            return UnquantizedLinearMethod()
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -204,15 +235,77 @@ class NunchakuLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: NunchakuConfig):
         self.quant_config = quant_config
     
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Extract alpha from checkpoint or use default for CUDA kernel.
-        
-        Nunchaku's CUDA kernel computes: Output = (Accumulator × alpha) × wcscales
-        - If wtscale in checkpoint: use it as alpha
-        - Otherwise: use alpha=1.0, let wcscales handle per-channel scaling
+    @staticmethod
+    def _swap_swiglu_halves(layer: nn.Module) -> None:
+        """Swap gate/up halves of quantized MergedColumnParallelLinear weights.
+
+        Diffusers FeedForward (GEGLU) convention:
+            output = gate * silu(up)
+            weight layout: [gate_rows ; up_rows]  (gate = first half)
+
+        vLLM SiluAndMul convention:
+            output = silu(first_half) * second_half
+            weight layout: [silu_rows ; linear_rows]
+
+        To match, we swap: put up (silu'd) first, gate (linear) second.
         """
+        half = layer.qweight.shape[0] // 2
+        # qweight: (out, in//2) — swap output halves
+        layer.qweight.data = torch.cat(
+            [layer.qweight.data[half:], layer.qweight.data[:half]], dim=0
+        )
+
+        # wscales: (in//gs, out) — swap output halves (dim 1)
+        half_s = layer.wscales.shape[1] // 2
+        layer.wscales.data = torch.cat(
+            [layer.wscales.data[:, half_s:], layer.wscales.data[:, :half_s]],
+            dim=1,
+        )
+
+        # proj_up: (out, rank) — swap output halves
+        half_p = layer.proj_up.shape[0] // 2
+        layer.proj_up.data = torch.cat(
+            [layer.proj_up.data[half_p:], layer.proj_up.data[:half_p]], dim=0
+        )
+
+        # wcscales: (out,) — swap halves [nvfp4 only]
+        if hasattr(layer, "wcscales") and layer.wcscales is not None:
+            half_c = layer.wcscales.shape[0] // 2
+            layer.wcscales.data = torch.cat(
+                [layer.wcscales.data[half_c:], layer.wcscales.data[:half_c]]
+            )
+
+        logger.debug("Swapped SwiGLU gate/up halves for %s", type(layer).__name__)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Post-process quantized weights after checkpoint loading.
+
+        Two key steps:
+        1. SwiGLU shard swap for MergedColumnParallelLinear (w13):
+           Diffusers computes gate * silu(up) (gate=first half, up=second),
+           but vLLM's SiluAndMul computes silu(first) * second.
+           We swap the two output halves so the activation order matches.
+        2. Extract alpha from wtscale for the CUDA kernel.
+        """
+        # Materialize any meta-device parameters that weren't loaded from
+        # the checkpoint (e.g. wtscale, wcscales for nvfp4).  Find the
+        # device of an already-loaded parameter to use as the target.
+        target_device = None
+        for p in layer.parameters():
+            if not p.is_meta:
+                target_device = p.device
+                break
+        if target_device is not None:
+            for name, p in list(layer.named_parameters()):
+                if p.is_meta:
+                    new_p = Parameter(
+                        torch.ones_like(p, device=target_device),
+                        requires_grad=False,
+                    )
+                    setattr(layer, name, new_p)
+
         alpha: Optional[float] = None
-        
+
         # Extract wtscale from checkpoint if available
         if hasattr(layer, "wtscale") and layer.wtscale is not None:
             wtscale = layer.wtscale
@@ -542,5 +635,27 @@ class NunchakuLinearMethod(LinearMethodBase):
         
         # Reshape back to original shape (except last dimension)
         output = out_2d.reshape(*orig_shape[:-1], out_features)
-        
+
+        # Gated-activation output swap for MergedColumnParallelLinear.
+        #
+        # Nunchaku checkpoints are quantized from diffusers models.
+        # diffusers' gated activations (GEGLU, SwiGLU) use the convention:
+        #   hidden, gate = proj(x).chunk(2)  =>  [linear ; activation]
+        # vLLM's gated activations (SiluAndMul, GeluAndMul) use:
+        #   act(x[:d]) * x[d:]              =>  [activation ; linear]
+        #
+        # Since the qweight is stored in a tiled/interleaved MMA layout
+        # (see nunchaku/lora/flux/packer.py:pack_weight), we cannot swap
+        # the weight rows directly. Instead we swap the output halves here.
+        #
+        # Assumption: MergedColumnParallelLinear is only used for gated FFN
+        # (SwiGLU / GeGLU) whose downstream activation follows the vLLM
+        # convention. This holds for all current diffusion models (Z-Image,
+        # Flux2, HunyuanImage3, etc.). If a future model uses
+        # MergedColumnParallelLinear with a diffusers-convention activation,
+        # this swap must be skipped for that model.
+        if isinstance(layer, MergedColumnParallelLinear):
+            d = output.shape[-1] // 2
+            output = torch.cat([output[..., d:], output[..., :d]], dim=-1)
+
         return output
