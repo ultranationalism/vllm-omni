@@ -29,6 +29,7 @@ from vllm.logger import init_logger
 from .base import DiffusionQuantizationConfig
 from .fp8 import DiffusionFp8Config
 from .gguf import DiffusionGgufConfig
+from .nunchaku import DiffusionNunchakuConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -42,6 +43,7 @@ logger = init_logger(__name__)
 _QUANT_CONFIG_REGISTRY: dict[str, type[DiffusionQuantizationConfig]] = {
     "fp8": DiffusionFp8Config,
     "gguf": DiffusionGgufConfig,
+    "nunchaku": DiffusionNunchakuConfig,
 }
 
 SUPPORTED_QUANTIZATION_METHODS = list(_QUANT_CONFIG_REGISTRY.keys())
@@ -111,6 +113,7 @@ __all__ = [
     "DiffusionQuantizationConfig",
     "DiffusionFp8Config",
     "DiffusionGgufConfig",
+    "DiffusionNunchakuConfig",
     "get_diffusion_quant_config",
     "get_vllm_quant_config_for_layers",
     "SUPPORTED_QUANTIZATION_METHODS",

@@ -326,7 +326,11 @@ class DiffusersPipelineLoader:
         # all components' weights loading (AutoModel.from_pretrained etc).
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
-        if loaded_weights is not None:
+        # Skip strict check for quantized models: quantization methods may
+        # create extra parameters (e.g. wtscale, wcscales) that don't have
+        # corresponding entries in the checkpoint.
+        has_quant = self.od_config and getattr(self.od_config, "quantization_config", None) is not None
+        if loaded_weights is not None and not has_quant:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
                 raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")

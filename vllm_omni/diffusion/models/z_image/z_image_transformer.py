@@ -968,6 +968,9 @@ class ZImageTransformer2DModel(CachedTransformer):
         return x, {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Standard checkpoint stacked params mapping
+        # NOTE: use trailing dots to avoid substring collisions
+        # (e.g. ".w1." must NOT match ".w13.")
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self-attn
@@ -975,27 +978,53 @@ class ZImageTransformer2DModel(CachedTransformer):
             (".to_qkv.", ".to_k.", "k"),
             (".to_qkv.", ".to_v.", "v"),
             # ffn
-            (".w13", ".w1", 0),
-            (".w13", ".w3", 1),
+            (".w13.", ".w1.", 0),
+            (".w13.", ".w3.", 1),
         ]
         # Expose packed shard mappings for LoRA handling of fused projections.
         self.stacked_params_mapping = stacked_params_mapping
+
+        # Nunchaku (diffusers-style) checkpoint key remapping:
+        #   net.0.proj.* -> w13.*  (merged gate+up projection)
+        #   net.2.*      -> w2.*   (down projection)
+        nunchaku_path_rewrites = {
+            ".net.0.proj.": ".w13.",
+            ".net.2.": ".w2.",
+        }
 
         params_dict = dict(self.named_parameters())
 
         loaded_params = set[str]()
         for name, loaded_weight in weights:
+            # Apply Nunchaku key remapping if applicable
+            for old_path, new_path in nunchaku_path_rewrites.items():
+                if old_path in name:
+                    name = name.replace(old_path, new_path)
+                    break
+
+            # Try stacked params mapping (for standard checkpoints with
+            # separate to_q/to_k/to_v and w1/w3 weights).
+            # Quantized checkpoints (e.g. Nunchaku) may already have merged
+            # weights (to_qkv, w13) so these mappings won't match — the
+            # weight falls through to direct loading below.
+            matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
+                matched = True
                 break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+
+            if not matched:
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+
         return loaded_params

@@ -49,6 +49,29 @@ class DiffusionQuantizationConfig(ABC):
         """Return supported activation dtypes."""
         return [torch.bfloat16, torch.float16]
 
+    def transform_weight(
+        self, name: str, loaded_weight: "torch.Tensor", model_class_name: str = ""
+    ) -> list[tuple[str, "torch.Tensor"]]:
+        """Transform a checkpoint weight entry before it reaches load_weights.
+
+        Override this in subclasses to remap checkpoint key names and/or
+        manipulate tensors (e.g. split, swap shards) so the model's
+        load_weights sees the canonical naming convention.
+
+        Args:
+            name: Original weight name from checkpoint.
+            loaded_weight: The weight tensor.
+            model_class_name: The model class name (e.g. "ZImageTransformer2DModel"),
+                used by quantization methods that need per-model key mapping.
+
+        Returns:
+            A list of (new_name, tensor) pairs.  Most implementations return
+            a single pair; returning multiple pairs is useful when a single
+            checkpoint tensor must be split into several model parameters.
+            Returning an empty list drops the weight silently.
+        """
+        return [(name, loaded_weight)]
+
     @classmethod
     def get_min_capability(cls) -> int:
         """Minimum GPU compute capability required.
