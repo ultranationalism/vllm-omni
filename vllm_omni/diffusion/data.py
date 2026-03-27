@@ -609,6 +609,7 @@ class OmniDiffusionConfig:
                     f"got {type(self.quantization_config)!r}"
                 )
 
+
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
@@ -633,6 +634,11 @@ class OmniDiffusionConfig:
             kwargs["quantization_config"] = kwargs.pop("quantization")
         else:
             kwargs.pop("quantization", None)
+
+        # Check environment variable as fallback for enable_cpu_offload
+        if "enable_cpu_offload" not in kwargs:
+            if os.environ.get("DIFFUSION_CPU_OFFLOAD", "0") == "1":
+                kwargs["enable_cpu_offload"] = True
 
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
