@@ -219,6 +219,8 @@ class AsyncOmniDiffusion:
 
         if lora_requests:
             sampling_params.lora_requests = lora_requests
+            if not sampling_params.lora_scales:
+                sampling_params.lora_scales = [1.0] * len(lora_requests)
 
         request = OmniDiffusionRequest(
             prompts=prompts,
@@ -287,6 +289,8 @@ class AsyncOmniDiffusion:
 
         if lora_requests:
             sampling_params.lora_requests = lora_requests
+            if not sampling_params.lora_scales:
+                sampling_params.lora_scales = [1.0] * len(lora_requests)
 
         request = OmniDiffusionRequest(
             prompts=[prompt],
