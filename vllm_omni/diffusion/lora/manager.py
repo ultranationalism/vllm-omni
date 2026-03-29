@@ -236,14 +236,11 @@ class DiffusionLoRAManager:
 
         if len(lora_requests) != len(lora_scales):
             raise ValueError(
-                f"lora_requests ({len(lora_requests)}) and "
-                f"lora_scales ({len(lora_scales)}) must have the same length"
+                f"lora_requests ({len(lora_requests)}) and lora_scales ({len(lora_scales)}) must have the same length"
             )
 
         if len(lora_requests) > self.max_loras:
-            raise ValueError(
-                f"Requested {len(lora_requests)} adapters but max_loras={self.max_loras}"
-            )
+            raise ValueError(f"Requested {len(lora_requests)} adapters but max_loras={self.max_loras}")
 
         # Filter out zero-scale adapters
         active_requests: list[LoRARequest] = []

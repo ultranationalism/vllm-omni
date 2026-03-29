@@ -610,16 +610,13 @@ class OmniDiffusionConfig:
                     f"got {type(self.quantization_config)!r}"
                 )
 
-
         if self.max_loras < 1:
             raise ValueError("max_loras must be >= 1 for diffusion LoRA")
 
         if self.max_cpu_loras is None:
             self.max_cpu_loras = max(self.max_loras, 1)
         elif self.max_cpu_loras < self.max_loras:
-            raise ValueError(
-                f"max_cpu_loras ({self.max_cpu_loras}) must be >= max_loras ({self.max_loras})"
-            )
+            raise ValueError(f"max_cpu_loras ({self.max_cpu_loras}) must be >= max_loras ({self.max_loras})")
 
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
