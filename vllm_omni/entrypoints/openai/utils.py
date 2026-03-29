@@ -53,3 +53,39 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
 
     scale = float(lora_scale) if lora_scale is not None else None
     return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
+
+
+def parse_lora_requests(
+    lora_body: dict[str, Any] | list[dict[str, Any]] | None,
+) -> tuple[list[LoRARequest], list[float]]:
+    """Parse one or more LoRA objects into parallel lists of requests and scales.
+
+    Handles three shapes:
+      - ``None``  -> empty lists
+      - ``dict``  -> single adapter, wrapped in a one-element list
+      - ``list``  -> multiple adapters
+
+    Returns:
+        ``(lora_requests, lora_scales)`` with matching lengths.
+    """
+    if lora_body is None:
+        return [], []
+
+    items: list[dict[str, Any]]
+    if isinstance(lora_body, dict):
+        items = [lora_body]
+    elif isinstance(lora_body, list):
+        items = lora_body
+    else:
+        raise ValueError("Invalid lora field: expected a dict, list of dicts, or null.")
+
+    requests: list[LoRARequest] = []
+    scales: list[float] = []
+    for item in items:
+        req, scale = parse_lora_request(item)
+        if req is None:
+            continue
+        requests.append(req)
+        scales.append(scale if scale is not None else 1.0)
+
+    return requests, scales

@@ -174,6 +174,7 @@ class DiffusionWorker:
             pipeline=self.model_runner.pipeline,
             device=self.device,
             dtype=self.od_config.dtype,
+            max_loras=self.od_config.max_loras,
             max_cached_adapters=self.od_config.max_cpu_loras,
             lora_path=self.od_config.lora_path,
             lora_scale=self.od_config.lora_scale,
@@ -215,9 +216,12 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+                self.lora_manager.set_active_adapters(
+                    req.sampling_params.lora_requests,
+                    req.sampling_params.lora_scales,
+                )
             except Exception as exc:
-                if req.sampling_params.lora_request is not None:
+                if req.sampling_params.lora_requests:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
         return self.model_runner.execute_model(req)
@@ -228,9 +232,9 @@ class DiffusionWorker:
         if self.lora_manager is not None:
             # Step mode does not support LoRA yet. Clear any previously active
             # adapter first so worker-local LoRA state cannot leak in.
-            self.lora_manager.set_active_adapter(None)
+            self.lora_manager.set_active_adapters([], [])
 
-        if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
+        if any(new_req.req.sampling_params.lora_requests for new_req in scheduler_output.scheduled_new_reqs):
             raise ValueError("Step mode does not support LoRA yet.")
 
         return self.model_runner.execute_stepwise(scheduler_output)

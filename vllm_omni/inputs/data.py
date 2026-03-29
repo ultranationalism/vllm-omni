@@ -278,9 +278,9 @@ class OmniDiffusionSamplingParams:
     save_output: bool = True
     return_frames: bool = False
 
-    # LoRA
-    lora_request: LoRARequest | None = None
-    lora_scale: float = 1.0
+    # LoRA — multiple adapters can be composed per request
+    lora_requests: list[LoRARequest] = field(default_factory=list)
+    lora_scales: list[float] = field(default_factory=list)
 
     # STA parameters
     STA_param: list | None = None

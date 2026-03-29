@@ -177,7 +177,7 @@ class AsyncOmniDiffusion:
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
-        lora_request: LoRARequest | None = None,
+        lora_requests: list[LoRARequest] | None = None,
     ) -> OmniRequestOutput:
         """Generate images from multiple prompts in a single engine call.
 
@@ -190,14 +190,14 @@ class AsyncOmniDiffusion:
             prompts: List of text prompts describing the desired images.
             sampling_params: Shared sampling parameters for all prompts.
             request_id: Optional unique identifier. Auto-generated when *None*.
-            lora_request: Optional LoRA adapter to apply.
+            lora_requests: Optional list of LoRA adapters to apply.
 
         Returns:
             A single ``OmniRequestOutput`` with all images combined.
         """
         if request_id is None:
             request_id = f"diff-batch-{uuid.uuid4().hex[:8]}"
-        return await self._generate_batch(prompts, sampling_params, request_id, lora_request)
+        return await self._generate_batch(prompts, sampling_params, request_id, lora_requests)
 
     # ------------------------------------------------------------------
     # Internal batch generation
@@ -208,7 +208,7 @@ class AsyncOmniDiffusion:
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str,
-        lora_request: LoRARequest | None = None,
+        lora_requests: list[LoRARequest] | None = None,
     ) -> OmniRequestOutput:
         """Generate images from multiple prompts in a single engine call."""
         if not prompts:
@@ -217,8 +217,8 @@ class AsyncOmniDiffusion:
         if sampling_params.guidance_scale:
             sampling_params.guidance_scale_provided = True
 
-        if lora_request is not None:
-            sampling_params.lora_request = lora_request
+        if lora_requests:
+            sampling_params.lora_requests = lora_requests
 
         request = OmniDiffusionRequest(
             prompts=prompts,
@@ -260,7 +260,7 @@ class AsyncOmniDiffusion:
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
-        lora_request: LoRARequest | None = None,
+        lora_requests: list[LoRARequest] | None = None,
     ) -> OmniRequestOutput:
         """Generate images asynchronously from a single text prompt.
 
@@ -272,7 +272,7 @@ class AsyncOmniDiffusion:
             prompt: Text prompt describing the desired image
             sampling_params: Sampling parameters
             request_id: Optional unique identifier for tracking the request
-            lora_request: Optional LoRA adapter to apply
+            lora_requests: Optional list of LoRA adapters to apply
 
         Returns:
             OmniRequestOutput containing generated images
@@ -285,8 +285,8 @@ class AsyncOmniDiffusion:
         if sampling_params.guidance_scale:
             sampling_params.guidance_scale_provided = True
 
-        if lora_request is not None:
-            sampling_params.lora_request = lora_request
+        if lora_requests:
+            sampling_params.lora_requests = lora_requests
 
         request = OmniDiffusionRequest(
             prompts=[prompt],

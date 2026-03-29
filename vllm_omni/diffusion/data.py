@@ -383,7 +383,8 @@ class OmniDiffusionConfig:
     # LoRA parameters
     lora_path: str | None = None
     lora_scale: float = 1.0
-    max_cpu_loras: int | None = None
+    max_loras: int = 1  # max adapters composed per request (GPU slot count)
+    max_cpu_loras: int | None = None  # max adapters cached on CPU (LRU)
 
     output_type: str = "pil"
 
@@ -609,10 +610,16 @@ class OmniDiffusionConfig:
                     f"got {type(self.quantization_config)!r}"
                 )
 
+
+        if self.max_loras < 1:
+            raise ValueError("max_loras must be >= 1 for diffusion LoRA")
+
         if self.max_cpu_loras is None:
-            self.max_cpu_loras = 1
-        elif self.max_cpu_loras < 1:
-            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+            self.max_cpu_loras = max(self.max_loras, 1)
+        elif self.max_cpu_loras < self.max_loras:
+            raise ValueError(
+                f"max_cpu_loras ({self.max_cpu_loras}) must be >= max_loras ({self.max_loras})"
+            )
 
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}

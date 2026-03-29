@@ -84,7 +84,7 @@ from vllm.utils.collection_utils import as_list
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
-from vllm_omni.entrypoints.openai.utils import parse_lora_request
+from vllm_omni.entrypoints.openai.utils import parse_lora_requests
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -2140,13 +2140,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.resolution = resolution
 
             # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
-            if lora_body and isinstance(lora_body, dict):
+            if lora_body:
                 try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
-                    if lora_req is not None:
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
+                    lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                    if lora_reqs:
+                        gen_params.lora_requests = lora_reqs
+                        gen_params.lora_scales = lora_scales
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
