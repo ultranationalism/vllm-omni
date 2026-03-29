@@ -20,7 +20,9 @@ class _DummyLoRALayer:
         self.n_slices = n_slices
         self.output_slices = output_slices
         # Keyed by slot index
-        self.set_calls: list[tuple[int, list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]] = []
+        self.set_calls: list[
+            tuple[int, list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
+        ] = []
         self.reset_calls: list[int] = []
         self._n_active_adapters: int = 0
 
@@ -41,7 +43,9 @@ class _DummyBaseLayerWithLoRA(torch.nn.Module):
         super().__init__()
         self.base_layer = base_layer
 
-        self.set_calls: list[tuple[int, list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]] = []
+        self.set_calls: list[
+            tuple[int, list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
+        ] = []
         self.reset_calls: list[int] = []
         self.create_calls: int = 0
         self._n_active_adapters: int = 0
@@ -619,8 +623,11 @@ def test_multi_adapter_unused_slots_are_reset():
     adapters = {}
     for aid in [1, 2, 3]:
         lora = LoRALayerWeights(
-            module_name="foo", rank=rank, lora_alpha=rank,
-            lora_a=torch.ones((rank, 4)), lora_b=torch.ones((4, rank)),
+            module_name="foo",
+            rank=rank,
+            lora_alpha=rank,
+            lora_a=torch.ones((rank, 4)),
+            lora_b=torch.ones((4, rank)),
         )
         adapters[aid] = type(
             "LM", (), {"id": aid, "loras": {"transformer.foo": lora}, "get_lora": lambda self, k: self.loras.get(k)}
@@ -715,8 +722,11 @@ def test_multi_adapter_skips_zero_scale(monkeypatch):
 
     rank = 2
     lora = LoRALayerWeights(
-        module_name="foo", rank=rank, lora_alpha=rank,
-        lora_a=torch.ones((rank, 4)), lora_b=torch.ones((4, rank)),
+        module_name="foo",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 4)),
+        lora_b=torch.ones((4, rank)),
     )
     for aid in [1, 2]:
         manager._registered_adapters[aid] = type(
