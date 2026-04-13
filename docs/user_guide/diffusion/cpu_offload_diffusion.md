@@ -36,6 +36,14 @@ m = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers", enable_cpu_offload=True)
 vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-cpu-offload
 ```
 
+**Environment variable:**
+
+Set `DIFFUSION_CPU_OFFLOAD=1` to enable model-level offload without touching code or CLI flags. The explicit `enable_cpu_offload` kwarg / `--enable-cpu-offload` flag takes precedence when provided.
+
+```bash
+DIFFUSION_CPU_OFFLOAD=1 vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers
+```
+
 ### Limitations
 - Cold start latency increases
 - Adds overhead from CPU-GPU transfers between encoder and denoising phases
