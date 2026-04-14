@@ -12,9 +12,14 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     Diffusion-specific base that overrides apply() to use direct torch matmul
     instead of punica_wrapper.
 
-    Supports multi-LoRA composition: multiple adapters can be active
-    simultaneously, each in its own slot. The apply() method accumulates
-    deltas from all active adapter slots.
+    punica_wrapper is used to hold multiple LoRA slots and slices efficiently.
+
+    This matches the semantics of PunicaWrapperGPU.add_lora_linear():
+    - Shrink: buffer = (x @ lora_a.T)
+    - Expand: y += buffer @ lora_b.T
+
+    Multi-LoRA composition: multiple adapters can be active simultaneously,
+    each in its own slot; apply() accumulates deltas from all active slots.
 
     All other functionality (weight management, TP slicing, forward logic)
     is inherited from vLLM's BaseLinearLayerWithLoRA.
