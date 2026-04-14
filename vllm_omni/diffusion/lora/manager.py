@@ -380,12 +380,16 @@ class DiffusionLoRAManager:
 
         lora_config = self._make_lora_config()
 
-        for component_name in ("transformer", "transformer_2", "dit"):
+        for component_name in ("transformer", "transformer_2", "dit", "bagel"):
             if not hasattr(self.pipeline, component_name):
                 continue
             component = getattr(self.pipeline, component_name)
             if not isinstance(component, nn.Module):
                 continue
+
+            # Collect replacements first to avoid mutating the module tree
+            # while iterating over named_modules().
+            pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
 
             for module_name, module in component.named_modules(remove_duplicate=False):
                 # Don't recurse into already-replaced LoRA wrappers. Their
@@ -415,6 +419,9 @@ class DiffusionLoRAManager:
                     if not should_replace:
                         continue
 
+                pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
+
+            for module_name, full_module_name, module, packed_modules_list in pending_replacements:
                 lora_layer = from_layer_diffusion(
                     layer=module,
                     max_loras=self.max_loras,
@@ -626,6 +633,9 @@ class DiffusionLoRAManager:
         self._active_adapter_scales = list(scales)
 
     def _deactivate_all_adapters(self) -> None:
+        if not self._active_adapter_ids:
+            logger.debug("All adapters already inactive")
+            return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             for slot_index in range(self.max_loras):

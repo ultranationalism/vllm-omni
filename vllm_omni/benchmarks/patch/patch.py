@@ -143,7 +143,11 @@ async def async_request_openai_chat_omni_completions(
                 if response.status == 200:
                     handler = StreamedResponseHandler()
                     async for chunk_bytes in response.content.iter_any():
-                        chunk_bytes = chunk_bytes.strip()
+                        # NOTE: Do NOT strip() here; TCP may fragment the SSE messages,
+                        # so stripping here can cause problems depending on how it is split.
+                        #
+                        # Simple example: [b'data: ',  b'{json}\n\n'] <- stripping the first
+                        # chunk will break SSE parsing because the space after 'data:' is required.
                         if not chunk_bytes:
                             continue
 
@@ -189,6 +193,10 @@ async def async_request_openai_chat_omni_completions(
 
                                 if metrics := data.get("metrics"):
                                     output.output_tokens = metrics.get("num_tokens_out", 0)
+
+                                if usage := data.get("usage"):
+                                    if (pt := usage.get("prompt_tokens")) is not None:
+                                        output.prompt_len = pt
 
                     output.latency = timestamp - st
                     output.generated_text = generated_text
@@ -358,6 +366,7 @@ async def benchmark(
     lora_modules: Iterable[str] | None,
     extra_headers: dict | None,
     extra_body: dict | None,
+    lora_assignment: Literal["random", "round-robin"] = "random",
     ramp_up_strategy: Literal["linear", "exponential"] | None = None,
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
@@ -454,8 +463,11 @@ async def benchmark(
     print("Starting main benchmark run...")
 
     if lora_modules:
-        # For each input request, choose a LoRA module at random.
-        lora_modules = iter([random.choice(lora_modules) for _ in range(len(input_requests))])
+        lora_modules_list = list(lora_modules)
+        if lora_assignment == "round-robin":
+            lora_modules = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
+        else:
+            lora_modules = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")

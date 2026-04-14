@@ -7,6 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.conftest import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -16,15 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vllm_omni import Omni
-
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 
 # This test is specific to Z-Image LoRA behavior. Keep it focused on a single
 # model to reduce runtime and avoid extra downloads.
 models = ["Tongyi-MAI/Z-Image-Turbo"]
-DIFFUSION_INIT_TIMEOUT_S = 600
 
 
 def _extract_images(outputs: list[OmniRequestOutput]):
@@ -92,12 +90,8 @@ def _write_zimage_lora(
 
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str, tmp_path: Path):
-    m = Omni(
-        model=model_name,
-        stage_init_timeout=DIFFUSION_INIT_TIMEOUT_S,
-        init_timeout=DIFFUSION_INIT_TIMEOUT_S,
-    )
-    try:
+    with OmniRunner(model_name) as runner:
+        m = runner.omni
         # high resolution may cause OOM on L4
         height = 256
         width = 256
@@ -155,8 +149,6 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
 
             diff = np.abs(np.array(images[0], dtype=np.int16) - np.array(images_lora[0], dtype=np.int16)).mean()
             assert diff > 0.0
-    finally:
-        m.close()
 
 
 @pytest.mark.parametrize("model_name", models)
@@ -165,13 +157,8 @@ def test_diffusion_multi_lora_composition(model_name: str, tmp_path: Path):
     if model_name != "Tongyi-MAI/Z-Image-Turbo":
         pytest.skip("Multi-LoRA composition test is Z-Image specific")
 
-    m = Omni(
-        model=model_name,
-        max_loras=2,
-        stage_init_timeout=DIFFUSION_INIT_TIMEOUT_S,
-        init_timeout=DIFFUSION_INIT_TIMEOUT_S,
-    )
-    try:
+    with OmniRunner(model_name, max_loras=2) as runner:
+        m = runner.omni
         from vllm_omni.lora.request import LoRARequest
         from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -231,5 +218,3 @@ def test_diffusion_multi_lora_composition(model_name: str, tmp_path: Path):
         assert diff_base_ab > 0.0, "Composed A+B should differ from baseline"
         assert diff_a_ab > 0.0, "Composed A+B should differ from A alone"
         assert diff_b_ab > 0.0, "Composed A+B should differ from B alone"
-    finally:
-        m.close()

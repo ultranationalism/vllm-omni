@@ -7,8 +7,12 @@ import pytest
 import torch
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.utils import get_supported_lora_modules
-from vllm.model_executor.layers.linear import LinearBase
 
+from tests.diffusion.lora.conftest import (
+    DummyBaseLayerWithLoRA,
+    FakeLinearBase,
+    fake_replace_submodule,
+)
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.lora.request import LoRARequest
 
@@ -33,31 +37,9 @@ class _DummyLoRALayer:
         self.reset_calls.append(index)
 
 
-class _FakeLinearBase(LinearBase):
-    def __init__(self):
-        torch.nn.Module.__init__(self)
-
-
-class _DummyBaseLayerWithLoRA(torch.nn.Module):
-    def __init__(self, base_layer: torch.nn.Module):
-        super().__init__()
-        self.base_layer = base_layer
-
-        self.set_calls: list[
-            tuple[int, list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
-        ] = []
-        self.reset_calls: list[int] = []
-        self.create_calls: int = 0
-        self._n_active_adapters: int = 0
-
-    def set_lora(self, index: int, lora_a, lora_b):
-        self.set_calls.append((index, lora_a, lora_b))
-
-    def reset_lora(self, index: int):
-        self.reset_calls.append(index)
-
-    def create_lora_weights(self, max_loras, lora_config, model_config):
-        self.create_calls += 1
+# Aliases for backward compatibility within this file
+_FakeLinearBase = FakeLinearBase
+_DummyBaseLayerWithLoRA = DummyBaseLayerWithLoRA
 
 
 class _DummyPipeline(torch.nn.Module):
@@ -758,3 +740,45 @@ def test_multi_adapter_are_active_at_scales():
     assert not manager._are_active_at_scales([1, 2], [0.5, 0.8])
     assert not manager._are_active_at_scales([1], [0.5])
     assert not manager._are_active_at_scales([2, 1], [0.75, 0.5])
+
+
+def test_lora_manager_discovers_bagel_component(monkeypatch):
+    """Verify that _replace_layers_with_lora finds layers under 'bagel'."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    def _fake_from_layer_diffusion(*, layer: torch.nn.Module, **_kwargs):
+        if isinstance(layer, _FakeLinearBase):
+            return _DummyBaseLayerWithLoRA(layer)
+        return layer
+
+    replace_calls: list[str] = []
+
+    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
+    )
+
+    # Pipeline with a 'bagel' component (no 'transformer')
+    pipeline = torch.nn.Module()
+    pipeline.bagel = torch.nn.Module()
+    pipeline.bagel.language_model = torch.nn.Module()
+    pipeline.bagel.language_model.qkv_proj = _FakeLinearBase()
+
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    peft_helper = type("_PH", (), {"r": 1})()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert "language_model.qkv_proj" in replace_calls
+    assert "bagel.language_model.qkv_proj" in manager._lora_modules
+    # Verify the module was actually replaced in the tree (not just recorded)
+    assert isinstance(pipeline.bagel.language_model.qkv_proj, _DummyBaseLayerWithLoRA)
