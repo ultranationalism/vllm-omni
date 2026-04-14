@@ -239,6 +239,7 @@ class DiffusionLoRAManager:
                 f"lora_requests ({len(lora_requests)}) and lora_scales ({len(lora_scales)}) must have the same length"
             )
 
+        # scale=0.0 still occupies a slot; it is not equivalent to omitting the adapter.
         if len(lora_requests) > self.max_loras:
             raise ValueError(f"Requested {len(lora_requests)} adapters but max_loras={self.max_loras}")
 
