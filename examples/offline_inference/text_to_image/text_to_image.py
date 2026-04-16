@@ -245,6 +245,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="XYZ plot mode: for each prompt, render a matrix of LoRA combos "
         "(baseline / each adapter alone / all composed) and stitch them into grid.png. "
+        "The composed column is only added when --lora-paths has >=2 entries. "
         "Requires --output-dir and at least one --lora-paths entry.",
     )
     parser.add_argument(
@@ -411,6 +412,11 @@ def main():
         )
     if args.xyz and not lora_is_per_request:
         raise ValueError("--xyz requires --lora-paths to define the adapters to plot.")
+    if args.max_loras is not None and args.lora_paths and args.max_loras < len(args.lora_paths):
+        raise ValueError(
+            f"--max-loras ({args.max_loras}) is smaller than len(--lora-paths) ({len(args.lora_paths)}). "
+            "The composed combo needs one slot per adapter — raise --max-loras or remove it to auto-size."
+        )
 
     cache_config = None
     cache_backend = args.cache_backend
