@@ -90,7 +90,7 @@ sampling_params = OmniDiffusionSamplingParams(
 - `lora_requests=[req]` → single adapter at the given scale.
 - `lora_requests=[req_a, req_b, ...]` → multi-LoRA: all listed adapters are activated simultaneously, each in its own cache slot, and their deltas are summed during the forward pass.
 
-The cache is sized by `max_loras` (defaults to 1). Set `Omni(..., max_loras=N)` when you plan to activate up to `N` adapters concurrently — requests exceeding this limit are rejected.
+The cache is sized by `max_loras` (defaults to 1). Set `Omni(..., max_loras=N)` when you plan to activate up to `N` adapters concurrently — requests exceeding this limit are rejected. The example CLI at `examples/offline_inference/text_to_image/text_to_image.py` auto-sizes this to `max(len(--lora-paths), 1)` when `--max-loras` is omitted.
 
 ### Scale Semantics
 
@@ -148,7 +148,7 @@ outputs = omni.generate(
 )
 ```
 
-**Switching adapters per-request inside a batch** — different requests in the same `omni.generate([...])` call can have different adapter sets by building a distinct `OmniDiffusionSamplingParams` per request (pass as `sampling_params_list=`).
+**Switching adapters between requests** — issue separate `omni.generate(...)` calls with different `OmniDiffusionSamplingParams`. `sampling_params_list` on `omni.generate` is stage-indexed (one entry per pipeline stage) and is shared across all prompts in a batch, so per-prompt adapter variance within a single batch call is not supported through that path.
 
 **CLI:**
 
