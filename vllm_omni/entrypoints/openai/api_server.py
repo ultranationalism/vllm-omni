@@ -113,7 +113,7 @@ from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpee
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request, parse_lora_requests
+from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
@@ -1667,16 +1667,6 @@ def _get_lora_from_json_str(lora_body):
         raise HTTPException(status_code=400, detail="LoRA must be a JSON object or array of objects")
 
     return lora_dict
-
-
-def _parse_lora_request(lora_body: dict[str, Any]):
-    try:
-        return parse_lora_request(lora_body)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=str(e),
-        ) from e
 
 
 def _parse_lora_requests(lora_body: dict[str, Any] | list[dict[str, Any]] | None):

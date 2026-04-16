@@ -88,6 +88,8 @@ def _write_zimage_lora(
     return str(adapter_dir)
 
 
+@pytest.mark.diffusion
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str, tmp_path: Path):
     with OmniRunner(model_name) as runner:
@@ -151,6 +153,8 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
             assert diff > 0.0
 
 
+@pytest.mark.diffusion
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_multi_lora_composition(model_name: str, tmp_path: Path):
     """Test that composing two LoRA adapters produces different output than either alone."""

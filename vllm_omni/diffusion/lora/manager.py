@@ -505,6 +505,10 @@ class DiffusionLoRAManager:
 
     def _are_active_at_scales(self, adapter_ids: list[int], scales: list[float]) -> bool:
         """True if the given adapters are already active at the given scales."""
+        # TODO: order-sensitive — re-requesting the same adapter set in a
+        # different order forces full re-activation even though LoRA deltas
+        # compose via addition (commutative). Consider comparing as a
+        # (id, scale) multiset to skip redundant work.
         if len(adapter_ids) != len(self._active_adapter_ids):
             return False
         for aid, scale, active_aid, active_scale in zip(
