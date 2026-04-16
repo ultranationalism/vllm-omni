@@ -73,6 +73,7 @@ python text_to_image.py \
 | Argument | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
 | `--prompt` | str | `"a cup of coffee on the table"` | Text description for image generation |
+| `--prompts` | str+ | — | Multiple prompts for batched generation. Overrides `--prompt`. Requires `--output-dir`. |
 | `--seed` | int | `142` | Integer seed for deterministic sampling |
 | `--negative-prompt` | str | `None` | Negative prompt for classifier-free conditional guidance |
 | `--cfg-scale` | float | `4.0` | True CFG scale (model-specific guidance strength) |
@@ -81,7 +82,8 @@ python text_to_image.py \
 | `--num-inference-steps` | int | `50` | Diffusion sampling steps (more steps = higher quality, slower) |
 | `--height` | int | `1024` | Output image height in pixels |
 | `--width` | int | `1024` | Output image width in pixels |
-| `--output` | str | `"qwen_image_output.png"` | Path to save the generated image |
+| `--output` | str | `"qwen_image_output.png"` | Single-image output file path (one prompt, one LoRA combo, one image) |
+| `--output-dir` | str | — | Output directory for batch / multi-LoRA / XYZ runs. Files are named `p{prompt_idx}_c{combo_idx}_n{img_idx}.png`; XYZ mode also writes `grid.png`. |
 | `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
@@ -89,8 +91,12 @@ python text_to_image.py \
 | `--ring-degree` | int | `1` | Ring sequence parallel degree for hybrid Ulysses + Ring inference |
 | `--ulysses-mode` | str | `"strict"` | Ulysses SP mode: `"strict"` or `"advanced_uaa"` |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
-| `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--lora-path` | str | — | Path to a PEFT LoRA adapter folder for init-time static load |
+| `--lora-scale` | float | `1.0` | Scale factor for `--lora-path` |
+| `--lora-paths` | str+ | — | One or more PEFT LoRA adapter folders for per-request composition. Mutex with `--lora-path`. |
+| `--lora-scales` | float+ | `[1.0 ...]` | Per-adapter scales for `--lora-paths` (length must match) |
+| `--max-loras` | int | auto | LoRA cache slot count. Defaults to `max(len(--lora-paths), 1)` |
+| `--xyz` | flag | off | Render a `{baseline, each-LoRA, composed}` × prompts matrix plus a stitched `grid.png`. Requires `--lora-paths` and `--output-dir`. |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 
@@ -251,7 +257,9 @@ See more examples in the [cfg_parallel user guide](../../../docs/user_guide/para
 
 #### LoRA
 
-This example supports PEFT-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. Pass `--lora-path` to use a LoRA adapter and optionally `--lora-scale` (default `1.0`); omit it to use the base model only.
+This example supports PEFT-compatible LoRA (Low-Rank Adaptation) adapters in two modes — see the [LoRA feature guide](../../../docs/user_guide/diffusion/lora.md) for a full description.
+
+**Init-time LoRA** — one adapter is pre-loaded when `Omni` starts and applied to every generation:
 
 ```bash
 python text_to_image.py \
@@ -261,6 +269,33 @@ python text_to_image.py \
   --lora-scale 1.0 \
   --output output.png
 ```
+
+**Per-request LoRA (incl. multi-LoRA composition)** — one or more adapters are attached to each request via `sampling_params.lora_requests`. Size the adapter cache with `--max-loras`:
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "A piece of cheesecake" \
+  --lora-paths /lora/style_a /lora/style_b \
+  --lora-scales 1.0 0.5 \
+  --max-loras 2 \
+  --output-dir outputs/composed/
+```
+
+**XYZ plot** — render a matrix of `{baseline, each LoRA alone, composed}` × `{prompts}` and stitch the cells into `grid.png`. Useful for eyeballing each adapter's contribution:
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompts "A piece of cheesecake" "A cat sitting on a laptop" \
+  --lora-paths /lora/style_a /lora/style_b \
+  --lora-scales 1.0 1.0 \
+  --max-loras 2 \
+  --xyz \
+  --output-dir outputs/xyz/
+```
+
+`--lora-path` and `--lora-paths` are mutually exclusive. `--output-dir` is required whenever the script produces more than one image (multiple prompts, multiple LoRA combos, or `--num-images-per-prompt > 1`).
 
 LoRA adapters must be in PEFT format. A typical adapter directory structure:
 

@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
+        "--prompts",
+        nargs="+",
+        default=None,
+        help="Multiple prompts for batched generation. Overrides --prompt when set. "
+        "Each prompt is dispatched as part of a single omni.generate() batch call.",
+    )
+    parser.add_argument(
         "--negative-prompt",
         default=None,
         help="negative prompt for classifier-free conditional guidance.",
@@ -73,7 +80,16 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=str,
         default="qwen_image_output.png",
-        help="Path to save the generated image (PNG).",
+        help="Path to save the generated image (PNG). Used only in single-output mode "
+        "(one prompt, one LoRA combo, one image). Ignored when --output-dir is set.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for batch/XYZ output. Required when there are multiple prompts, "
+        "multiple LoRA combos, or --xyz is set. Files are saved as "
+        "p{prompt_idx}_c{combo_idx}_n{img_idx}.png; XYZ mode additionally writes a grid.png.",
     )
     parser.add_argument(
         "--num-images-per-prompt",
@@ -193,13 +209,43 @@ def parse_args() -> argparse.Namespace:
         "--lora-path",
         type=str,
         default=None,
-        help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
+        help="Path to LoRA adapter folder (PEFT format). Init-time static load: the adapter is "
+        "pre-loaded into the engine cache and applied to every request. Mutually exclusive with --lora-paths.",
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         default=1.0,
-        help="Scale factor for LoRA weights (default: 1.0).",
+        help="Scale factor for --lora-path (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-paths",
+        nargs="+",
+        default=None,
+        help="Multiple LoRA adapter folders (PEFT format) for per-request composition. "
+        "Each request applies all listed adapters with the matching --lora-scales. "
+        "Mutually exclusive with --lora-path.",
+    )
+    parser.add_argument(
+        "--lora-scales",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Per-adapter scales for --lora-paths. Length must match --lora-paths; "
+        "defaults to 1.0 per adapter when omitted.",
+    )
+    parser.add_argument(
+        "--max-loras",
+        type=int,
+        default=None,
+        help="Maximum number of LoRA slots active simultaneously. Defaults to max(len(--lora-paths), 1).",
+    )
+    parser.add_argument(
+        "--xyz",
+        action="store_true",
+        help="XYZ plot mode: for each prompt, render a matrix of LoRA combos "
+        "(baseline / each adapter alone / all composed) and stitch them into grid.png. "
+        "Requires --output-dir and at least one --lora-paths entry.",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -270,10 +316,101 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_prompts(args: argparse.Namespace) -> list[str]:
+    """Return the list of prompts to run. Prefers --prompts; falls back to --prompt."""
+    if args.prompts:
+        return list(args.prompts)
+    return [args.prompt]
+
+
+def _build_lora_request(path: str) -> LoRARequest:
+    return LoRARequest(
+        lora_name=Path(path).stem,
+        lora_int_id=stable_lora_int_id(path),
+        lora_path=path,
+    )
+
+
+def _resolve_lora_combos(args: argparse.Namespace) -> tuple[list[tuple[list[LoRARequest], list[float], str]], bool]:
+    """Resolve the list of LoRA combos to run for per-request composition.
+
+    Returns:
+        (combos, is_per_request) where combos is a list of
+        (lora_requests, lora_scales, label) tuples. ``is_per_request`` is True
+        when per-request LoRA (via --lora-paths / --xyz) is active; False when
+        the script runs in init-time LoRA mode (or no LoRA at all).
+
+    In XYZ mode the combos are: baseline (no LoRA) + each adapter alone + full
+    composition. Otherwise a single combo applies all --lora-paths at once.
+    """
+    if args.lora_path and args.lora_paths:
+        raise ValueError("--lora-path and --lora-paths are mutually exclusive.")
+
+    if not args.lora_paths:
+        # Init-time --lora-path (or no LoRA) — a single implicit combo per
+        # request, and the adapter is injected by Omni at init.
+        return [([], [], "default")], False
+
+    lora_paths = list(args.lora_paths)
+    if args.lora_scales is None:
+        lora_scales = [1.0] * len(lora_paths)
+    else:
+        lora_scales = list(args.lora_scales)
+    if len(lora_paths) != len(lora_scales):
+        raise ValueError(
+            f"--lora-paths ({len(lora_paths)}) and --lora-scales ({len(lora_scales)}) must have the same length."
+        )
+
+    requests = [_build_lora_request(p) for p in lora_paths]
+    names = [req.lora_name for req in requests]
+
+    if not args.xyz:
+        label = "+".join(f"{n}({s:.2f})" for n, s in zip(names, lora_scales))
+        return [(requests, lora_scales, label)], True
+
+    # XYZ mode: baseline + each adapter alone + composed
+    combos: list[tuple[list[LoRARequest], list[float], str]] = [([], [], "baseline")]
+    for req, scale in zip(requests, lora_scales):
+        combos.append(([req], [scale], f"{req.lora_name}({scale:.2f})"))
+    if len(requests) > 1:
+        composed_label = "+".join(f"{n}({s:.2f})" for n, s in zip(names, lora_scales))
+        combos.append((requests, lora_scales, composed_label))
+    return combos, True
+
+
+def _compose_grid(
+    results: dict[tuple[int, int], list[Any]],
+    num_rows: int,
+    num_cols: int,
+) -> Any:
+    """Stitch the first image of each (row, col) cell into a single grid PIL image."""
+    from PIL import Image
+
+    sample = next(iter(results.values()))[0]
+    cell_w, cell_h = sample.width, sample.height
+    grid = Image.new("RGB", (cell_w * num_cols, cell_h * num_rows), color="white")
+    for (r, c), imgs in results.items():
+        grid.paste(imgs[0], (c * cell_w, r * cell_h))
+    return grid
+
+
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     use_nextstep = is_nextstep_model(args.model)
+
+    prompts = _resolve_prompts(args)
+    lora_combos, lora_is_per_request = _resolve_lora_combos(args)
+
+    # --output-dir is required whenever the script produces more than one image
+    # (multiple prompts, multiple LoRA combos, or num_images_per_prompt > 1).
+    requires_output_dir = len(prompts) > 1 or len(lora_combos) > 1 or args.num_images_per_prompt > 1 or args.xyz
+    if requires_output_dir and not args.output_dir:
+        raise ValueError(
+            "--output-dir is required when running multiple prompts, multiple LoRA combos, "
+            "multiple images per prompt, or --xyz. Single --output is only valid for one image."
+        )
+    if args.xyz and not lora_is_per_request:
+        raise ValueError("--xyz requires --lora-paths to define the adapters to plot.")
 
     cache_config = None
     cache_backend = args.cache_backend
@@ -323,7 +460,14 @@ def main():
     lora_args: dict[str, Any] = {}
     if args.lora_path:
         lora_args["lora_path"] = args.lora_path
-        print(f"Using LoRA from: {args.lora_path}")
+        print(f"Using init-time LoRA from: {args.lora_path}")
+
+    # max_loras sizes the adapter cache at init. Per-request combos may load
+    # several adapters simultaneously, so default to max(len(lora_paths), 1).
+    if args.max_loras is not None:
+        lora_args["max_loras"] = args.max_loras
+    elif args.lora_paths:
+        lora_args["max_loras"] = max(len(args.lora_paths), 1)
 
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
@@ -393,22 +537,16 @@ def main():
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
-        print(f"  LoRA: scale={args.lora_scale}")
+        print(f"  Init-time LoRA: scale={args.lora_scale}")
+    if lora_is_per_request:
+        print(f"  Per-request LoRA combos ({len(lora_combos)}):")
+        for idx, combo in enumerate(lora_combos):
+            print(f"    [{idx}] {combo[2]}")
+    print(f"  Prompts: {len(prompts)}")
     if args.stage_configs_path:
         print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
 
-    # Build LoRA request when --lora-path is set
-    lora_request = None
-    if args.lora_path:
-        lora_request_id = stable_lora_int_id(args.lora_path)
-        lora_request = LoRARequest(
-            lora_name=Path(args.lora_path).stem,
-            lora_int_id=lora_request_id,
-            lora_path=args.lora_path,
-        )
-
-    generation_start = time.perf_counter()
     extra_args = {
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
@@ -416,27 +554,41 @@ def main():
         "use_system_prompt": args.use_system_prompt,
         "system_prompt": args.system_prompt,
     }
-    if lora_request:
-        extra_args["lora_request"] = lora_request
-        extra_args["lora_scale"] = args.lora_scale
 
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
+    prompt_batch = [{"prompt": p, "negative_prompt": args.negative_prompt} for p in prompts]
+    # (combo_idx, prompt_idx) -> list of PIL images (length == num_images_per_prompt)
+    cell_images: dict[tuple[int, int], list[Any]] = {}
+
+    generation_start = time.perf_counter()
+    for combo_idx, (lora_reqs, lora_scales, combo_label) in enumerate(lora_combos):
+        # Fresh generator per combo so the seed is the only source of variance
+        # within a cell; across combos the seed is reused so differences isolate
+        # to the LoRA weights (matches the test in tests/e2e/.../test_diffusion_lora.py).
+        combo_generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+        sp = OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
-            generator=generator,
+            generator=combo_generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
             guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_images_per_prompt,
+            lora_requests=lora_reqs,
+            lora_scales=lora_scales,
             extra_args=extra_args,
-        ),
-    )
+        )
+        print(f"[combo {combo_idx}/{len(lora_combos) - 1}] {combo_label} ...")
+        combo_outputs = omni.generate(prompt_batch, sp)
+        if len(combo_outputs) != len(prompts):
+            raise ValueError(f"Expected {len(prompts)} outputs for combo {combo_idx}, got {len(combo_outputs)}.")
+        for p_idx, out in enumerate(combo_outputs):
+            if not getattr(out, "request_output", None) or not hasattr(out.request_output, "images"):
+                raise ValueError(f"Combo {combo_idx} prompt {p_idx}: missing request_output.images")
+            imgs = out.request_output.images
+            if not imgs:
+                raise ValueError(f"Combo {combo_idx} prompt {p_idx}: empty image list")
+            cell_images[(combo_idx, p_idx)] = imgs
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -461,35 +613,28 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # omni.generate() returns list[OmniRequestOutput]
-    if not outputs or len(outputs) == 0:
-        raise ValueError("No output generated from omni.generate()")
-    logger.info(f"Outputs: {outputs}")
+    logger.info("Produced %d cells (combos=%d, prompts=%d)", len(cell_images), len(lora_combos), len(prompts))
 
-    first_output = outputs[0]
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
-
-    req_out = first_output.request_output
-    if not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images'.")
-
-    images = req_out.images
-    if not images:
-        raise ValueError("No images found in request_output")
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = output_path.suffix or ".png"
-    stem = output_path.stem or "qwen_image_output"
-    if len(images) <= 1:
-        images[0].save(output_path)
-        print(f"Saved generated image to {output_path}")
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for (c_idx, p_idx), imgs in cell_images.items():
+            for n_idx, img in enumerate(imgs):
+                save_path = out_dir / f"p{p_idx:02d}_c{c_idx:02d}_n{n_idx:02d}.png"
+                img.save(save_path)
+                print(f"Saved {save_path}")
+        if args.xyz:
+            grid = _compose_grid(cell_images, num_rows=len(prompts), num_cols=len(lora_combos))
+            grid_path = out_dir / "grid.png"
+            grid.save(grid_path)
+            print(f"Saved XYZ grid to {grid_path}")
     else:
-        for idx, img in enumerate(images):
-            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-            img.save(save_path)
-            print(f"Saved generated image to {save_path}")
+        # Single-output mode: exactly one cell, one image.
+        only_images = next(iter(cell_images.values()))
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        only_images[0].save(output_path)
+        print(f"Saved generated image to {output_path}")
 
 
 if __name__ == "__main__":
