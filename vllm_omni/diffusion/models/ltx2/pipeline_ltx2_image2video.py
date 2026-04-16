@@ -856,7 +856,7 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module):
                 lora_int_id=1,
                 lora_path=lora_path,
             )
-            self.lora_manager.set_active_adapter(lora_request, lora_scale=1.0)
+            self.lora_manager.set_active_adapters([lora_request], [1.0])
 
             # Change scheduler to use Stage 2 distilled sigmas as is
             new_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
