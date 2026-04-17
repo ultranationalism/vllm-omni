@@ -296,19 +296,6 @@ python text_to_image.py \
   --output-dir outputs/axis_test/
 ```
 
-Baseline-vs-each-LoRA matrix (mirrors the old `--xyz` mode) is a one-axis case:
-
-```bash
-python text_to_image.py \
-  --model Tongyi-MAI/Z-Image-Turbo \
-  --prompt "A piece of cheesecake" \
-  --lora-paths /lora/style_a /lora/style_b \
-  --max-loras 2 \
-  --axis "x=lora_scale[0]:0|1" \
-  --axis "y=lora_scale[1]:0|1" \
-  --output-dir outputs/composed/
-```
-
 Grid cells are labeled with `{adapter}\n{scale}` for LoRA-scale axes and the prompt text for a prompt axis; the Z banner shows the current slice.
 
 `--lora-path` and `--lora-paths` are mutually exclusive. `--output-dir` is required whenever the script produces more than one image (multiple prompts, any `--axis`, or `--num-images-per-prompt > 1`).
