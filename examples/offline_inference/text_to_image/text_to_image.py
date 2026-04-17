@@ -3,8 +3,10 @@
 
 import argparse
 import os
+import re
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -88,9 +90,9 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=str,
         default=None,
-        help="Directory for batch/XYZ output. Required when there are multiple prompts, "
-        "multiple LoRA combos, or --xyz is set. Files are saved as "
-        "p{prompt_idx}_c{combo_idx}_n{img_idx}.png; XYZ mode additionally writes a grid.png.",
+        help="Directory for batch/XYZ output. Required when there are multiple prompts "
+        "or --axis is set. Files are saved as cell_x{x}_y{y}_z{z}.png; with --axis a "
+        "grid.png (or grid_z{k}.png per Z value) is also written.",
     )
     parser.add_argument(
         "--num-images-per-prompt",
@@ -242,24 +244,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of LoRA slots active simultaneously. Defaults to max(len(--lora-paths), 1).",
     )
     parser.add_argument(
-        "--xyz",
-        action="store_true",
-        help="XYZ plot mode: for each prompt, render a matrix of LoRA combos "
-        "(baseline / each adapter alone / all composed) and stitch them into grid.png. "
-        "The composed column is only added when --lora-paths has >=2 entries. "
-        "Requires --output-dir and at least one --lora-paths entry.",
-    )
-    parser.add_argument(
-        "--xy-sweep",
-        nargs="+",
-        type=float,
+        "--axis",
+        action="append",
         default=None,
-        metavar="SCALE",
-        help="XY scale-sweep mode: requires exactly 2 --lora-paths and a single prompt. "
-        "Produces an N×N grid where the first adapter's scale varies along X (columns) "
-        "and the second along Y (rows); both axes use the scale values listed here. "
-        "Cells are labeled with scale values; axis headers show adapter names. "
-        "Mutually exclusive with --xyz.",
+        metavar="SPEC",
+        help='XYZ axis. Repeat up to 3 times. Spec form: NAME=TYPE:v1|v2|v3 where '
+        'NAME ∈ {x,y,z} and TYPE ∈ {prompt, lora_scale[i], guidance_scale, '
+        'num_inference_steps, seed}. The Cartesian product of X×Y×Z defines cells: '
+        'X is columns, Y is rows, Z produces one grid per value (grid_z{k}.png). '
+        'Example: --axis "x=lora_scale[0]:0|1" --axis "y=lora_scale[1]:0|1" '
+        '--axis "z=prompt:a girl|a cat" yields a 2×2 grid per prompt.',
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -345,65 +339,116 @@ def _build_lora_request(path: str) -> LoRARequest:
     )
 
 
-def _resolve_lora_combos(args: argparse.Namespace) -> tuple[list[tuple[list[LoRARequest], list[float], str]], bool]:
-    """Resolve the list of LoRA combos to run for per-request composition.
+def _resolve_lora(
+    args: argparse.Namespace,
+) -> tuple[list[LoRARequest], list[float], bool]:
+    """Return (lora_requests, lora_scales, is_per_request) for the default cell.
 
-    Returns:
-        (combos, is_per_request) where combos is a list of
-        (lora_requests, lora_scales, label) tuples. ``is_per_request`` is True
-        when per-request LoRA (via --lora-paths / --xyz) is active; False when
-        the script runs in init-time LoRA mode (or no LoRA at all).
-
-    In XYZ mode the combos are: baseline (no LoRA) + each adapter alone + full
-    composition. Otherwise a single combo applies all --lora-paths at once.
+    ``is_per_request`` is True when --lora-paths is given (per-request LoRA),
+    False when --lora-path (init-time) or no LoRA is used.
     """
     if args.lora_path and args.lora_paths:
         raise ValueError("--lora-path and --lora-paths are mutually exclusive.")
 
     if not args.lora_paths:
-        # Init-time --lora-path (or no LoRA) — a single implicit combo per
-        # request, and the adapter is injected by Omni at init.
-        return [([], [], "default")], False
+        return [], [], False
 
     lora_paths = list(args.lora_paths)
-    if args.lora_scales is None:
-        lora_scales = [1.0] * len(lora_paths)
-    else:
-        lora_scales = list(args.lora_scales)
+    lora_scales = list(args.lora_scales) if args.lora_scales is not None else [1.0] * len(lora_paths)
     if len(lora_paths) != len(lora_scales):
         raise ValueError(
             f"--lora-paths ({len(lora_paths)}) and --lora-scales ({len(lora_scales)}) must have the same length."
         )
-
     requests = [_build_lora_request(p) for p in lora_paths]
-    names = [req.lora_name for req in requests]
+    return requests, lora_scales, True
 
-    if args.xy_sweep:
-        if args.xyz:
-            raise ValueError("--xy-sweep and --xyz are mutually exclusive.")
-        if len(requests) != 2:
-            raise ValueError(f"--xy-sweep requires exactly 2 --lora-paths, got {len(requests)}.")
-        scales = list(args.xy_sweep)
-        # y-major order so combo_idx = y_idx * N + x_idx recovers the 2D shape later.
-        combos_xy: list[tuple[list[LoRARequest], list[float], str]] = []
-        for y_scale in scales:
-            for x_scale in scales:
-                label = f"{names[0]}={x_scale:.2f}|{names[1]}={y_scale:.2f}"
-                combos_xy.append((requests, [x_scale, y_scale], label))
-        return combos_xy, True
 
-    if not args.xyz:
-        label = "+".join(f"{n}({s:.2f})" for n, s in zip(names, lora_scales))
-        return [(requests, lora_scales, label)], True
+_LORA_SCALE_TYPE_RE = re.compile(r"^lora_scale\[(\d+)\]$")
+_AXIS_TYPES = {"prompt", "guidance_scale", "num_inference_steps", "seed"}
 
-    # XYZ mode: baseline + each adapter alone + composed
-    combos: list[tuple[list[LoRARequest], list[float], str]] = [([], [], "baseline")]
-    for req, scale in zip(requests, lora_scales):
-        combos.append(([req], [scale], f"{req.lora_name}({scale:.2f})"))
-    if len(requests) > 1:
-        composed_label = "+".join(f"{n}({s:.2f})" for n, s in zip(names, lora_scales))
-        combos.append((requests, lora_scales, composed_label))
-    return combos, True
+
+@dataclass
+class _Axis:
+    name: str  # 'x' | 'y' | 'z'
+    type: str
+    values: list[str]  # raw strings; converted per type when applied
+
+
+def _parse_axes(specs: list[str] | None) -> dict[str, _Axis]:
+    """Parse repeated --axis specs into a dict keyed by axis name."""
+    if not specs:
+        return {}
+    axes: dict[str, _Axis] = {}
+    for spec in specs:
+        name_part, sep, rest = spec.partition("=")
+        if not sep:
+            raise ValueError(f"--axis spec missing '=': {spec!r}")
+        type_part, sep, values_part = rest.partition(":")
+        if not sep:
+            raise ValueError(f"--axis spec missing ':' between type and values: {spec!r}")
+        name = name_part.strip().lower()
+        if name not in ("x", "y", "z"):
+            raise ValueError(f"--axis name must be x, y, or z; got {name!r}")
+        if name in axes:
+            raise ValueError(f"--axis {name} specified twice")
+        atype = type_part.strip()
+        if atype not in _AXIS_TYPES and not _LORA_SCALE_TYPE_RE.match(atype):
+            raise ValueError(
+                f"--axis type {atype!r} unknown. Supported: prompt, lora_scale[i], "
+                f"guidance_scale, num_inference_steps, seed."
+            )
+        values = [v.strip() for v in values_part.split("|") if v.strip()]
+        if not values:
+            raise ValueError(f"--axis {name} has no values: {spec!r}")
+        axes[name] = _Axis(name=name, type=atype, values=values)
+    return axes
+
+
+def _axis_label(axis: _Axis, value: str, lora_names: list[str]) -> str:
+    """Render a short cell-header label. Embeds a newline between name and value
+    so wide labels (e.g. ``lora_chardesign=1.00``) wrap cleanly in the grid
+    margin strips; the grid composer honors explicit newlines verbatim.
+    """
+    if axis.type == "prompt":
+        s = value if len(value) <= 40 else value[:37] + "..."
+        return s
+    m = _LORA_SCALE_TYPE_RE.match(axis.type)
+    if m:
+        idx = int(m.group(1))
+        name = lora_names[idx] if idx < len(lora_names) else f"lora[{idx}]"
+        return f"{name}\n{float(value):.2f}"
+    return f"{axis.type}\n{value}"
+
+
+def _apply_axis(
+    axis: _Axis,
+    raw_value: str,
+    cell: dict,
+    lora_count: int,
+) -> None:
+    """Mutate cell in place by applying a single axis value."""
+    t = axis.type
+    if t == "prompt":
+        cell["prompt"] = raw_value
+        return
+    m = _LORA_SCALE_TYPE_RE.match(t)
+    if m:
+        idx = int(m.group(1))
+        if idx >= lora_count:
+            raise ValueError(f"axis lora_scale[{idx}] but only {lora_count} LoRA(s) provided via --lora-paths")
+        cell["lora_scales"] = list(cell["lora_scales"])
+        cell["lora_scales"][idx] = float(raw_value)
+        return
+    if t == "guidance_scale":
+        cell["guidance_scale"] = float(raw_value)
+        return
+    if t == "num_inference_steps":
+        cell["num_inference_steps"] = int(raw_value)
+        return
+    if t == "seed":
+        cell["seed"] = int(raw_value)
+        return
+    raise ValueError(f"axis type {t!r} not implemented")
 
 
 def _compose_grid(
@@ -412,34 +457,48 @@ def _compose_grid(
     num_cols: int,
     row_labels: list[str] | None = None,
     col_labels: list[str] | None = None,
+    title: str | None = None,
 ) -> Any:
     """Stitch the first image of each (row, col) cell into a single grid PIL image.
 
-    If ``row_labels`` or ``col_labels`` are provided, reserve left/top strips and
-    render the labels so the viewer can tell what each cell represents.
+    Optional ``row_labels`` / ``col_labels`` reserve left/top strips with per-row
+    and per-column text. Optional ``title`` reserves a narrow banner on top.
     """
     from PIL import Image, ImageDraw
 
     sample = next(iter(results.values()))[0]
     cell_w, cell_h = sample.width, sample.height
 
-    top = max(64, cell_h // 10) if col_labels else 0
-    left = max(128, cell_w // 6) if row_labels else 0
+    col_strip = max(64, cell_h // 10) if col_labels else 0
+    row_strip = max(220, cell_w // 4) if row_labels else 0
+    title_strip = max(48, cell_h // 14) if title else 0
+
+    top = title_strip + col_strip
+    left = row_strip
 
     grid = Image.new("RGB", (left + cell_w * num_cols, top + cell_h * num_rows), color="white")
+    draw = ImageDraw.Draw(grid)
 
-    if col_labels or row_labels:
-        draw = ImageDraw.Draw(grid)
-        font = _load_label_font(max(18, (top or cell_h // 10) // 3))
-        if col_labels:
-            for c_idx, lbl in enumerate(col_labels):
-                x = left + c_idx * cell_w + cell_w // 2
-                draw.text((x, top // 2), lbl, fill="black", font=font, anchor="mm")
-        if row_labels:
-            for r_idx, lbl in enumerate(row_labels):
-                y = top + r_idx * cell_h + cell_h // 2
-                wrapped = "\n".join(textwrap.wrap(lbl, width=14)) or lbl
-                draw.text((left // 2, y), wrapped, fill="black", font=font, anchor="mm", align="center")
+    font = _load_label_font(max(18, (col_strip or cell_h // 10) // 3))
+    font_row = _load_label_font(max(16, (col_strip or cell_h // 10) // 4))
+    font_title = _load_label_font(max(22, title_strip // 2)) if title else font
+
+    if title:
+        draw.text(
+            (grid.size[0] // 2, title_strip // 2),
+            title, fill="black", font=font_title, anchor="mm",
+        )
+    if col_labels:
+        for c_idx, lbl in enumerate(col_labels):
+            x = left + c_idx * cell_w + cell_w // 2
+            y = title_strip + col_strip // 2
+            draw.text((x, y), lbl, fill="black", font=font, anchor="mm", align="center")
+    if row_labels:
+        for r_idx, lbl in enumerate(row_labels):
+            y = top + r_idx * cell_h + cell_h // 2
+            # Honor explicit newlines from axis labels; otherwise soft-wrap long text.
+            rendered = lbl if "\n" in lbl else ("\n".join(textwrap.wrap(lbl, width=18)) or lbl)
+            draw.text((row_strip // 2, y), rendered, fill="black", font=font_row, anchor="mm", align="center")
 
     for (r, c), imgs in results.items():
         grid.paste(imgs[0], (left + c * cell_w, top + r * cell_h))
@@ -462,64 +521,6 @@ def _load_label_font(size: int):
     return ImageFont.load_default()
 
 
-def _compose_xy_grid(
-    results: dict[tuple[int, int], list[Any]],
-    scales: list[float],
-    x_axis_name: str,
-    y_axis_name: str,
-) -> Any:
-    """Stitch an N×N scale-sweep into a single image with X (columns) and Y (rows) axis labels.
-
-    Layout:
-      - top strip shows ``X: {x_axis_name}`` centered across columns, then each column's scale.
-      - left strip shows ``Y: {y_axis_name}`` stacked vertically, then each row's scale.
-    """
-    from PIL import Image, ImageDraw
-
-    sample = next(iter(results.values()))[0]
-    cell_w, cell_h = sample.width, sample.height
-    n = len(scales)
-
-    top = max(160, cell_h // 7)
-    left = max(240, cell_w // 5)
-
-    font_title = _load_label_font(max(22, top // 4))
-    font_tick = _load_label_font(max(28, top // 3))
-
-    grid = Image.new("RGB", (left + cell_w * n, top + cell_h * n), color="white")
-    draw = ImageDraw.Draw(grid)
-
-    # X axis title: centered across the column area, in the upper half of the top strip.
-    draw.text(
-        (left + (cell_w * n) // 2, top // 4),
-        f"X: {x_axis_name}",
-        fill="black", font=font_title, anchor="mm",
-    )
-    # Y axis title: stacked one character per line in the left half of the left strip.
-    y_title = f"Y: {y_axis_name}"
-    draw.text(
-        (left // 4, top + (cell_h * n) // 2),
-        "\n".join(y_title),
-        fill="black", font=font_title, anchor="mm", align="center",
-    )
-
-    # Scale ticks: column scales under the X title, row scales beside the Y title.
-    for i, s in enumerate(scales):
-        draw.text(
-            (left + i * cell_w + cell_w // 2, top - top // 4),
-            f"{s:.2f}",
-            fill="black", font=font_tick, anchor="mm",
-        )
-        draw.text(
-            (left - left // 4, top + i * cell_h + cell_h // 2),
-            f"{s:.2f}",
-            fill="black", font=font_tick, anchor="mm",
-        )
-
-    for (r, c), imgs in results.items():
-        grid.paste(imgs[0], (left + c * cell_w, top + r * cell_h))
-
-    return grid
 
 
 def main():
@@ -527,32 +528,26 @@ def main():
     use_nextstep = is_nextstep_model(args.model)
 
     prompts = _resolve_prompts(args)
-    lora_combos, lora_is_per_request = _resolve_lora_combos(args)
+    lora_requests, lora_scales, lora_is_per_request = _resolve_lora(args)
+    axes = _parse_axes(args.axis)
 
-    # --output-dir is required whenever the script produces more than one image
-    # (multiple prompts, multiple LoRA combos, or num_images_per_prompt > 1).
+    if axes and len(prompts) > 1:
+        raise ValueError(
+            "--axis cannot be combined with multi-prompt input; put prompts on the prompt axis instead, "
+            'e.g. --axis "z=prompt:a|b".'
+        )
     requires_output_dir = (
-        len(prompts) > 1
-        or len(lora_combos) > 1
-        or args.num_images_per_prompt > 1
-        or args.xyz
-        or bool(args.xy_sweep)
+        len(prompts) > 1 or args.num_images_per_prompt > 1 or bool(axes)
     )
     if requires_output_dir and not args.output_dir:
         raise ValueError(
-            "--output-dir is required when running multiple prompts, multiple LoRA combos, "
-            "multiple images per prompt, --xyz, or --xy-sweep. Single --output is only valid for one image."
-        )
-    if args.xyz and not lora_is_per_request:
-        raise ValueError("--xyz requires --lora-paths to define the adapters to plot.")
-    if args.xy_sweep and len(prompts) != 1:
-        raise ValueError(
-            f"--xy-sweep requires exactly one prompt (both grid axes are consumed by the LoRA scales), got {len(prompts)}."
+            "--output-dir is required when running multiple prompts, multiple images per prompt, "
+            "or --axis. Single --output is only valid for one image."
         )
     if args.max_loras is not None and args.lora_paths and args.max_loras < len(args.lora_paths):
         raise ValueError(
             f"--max-loras ({args.max_loras}) is smaller than len(--lora-paths) ({len(args.lora_paths)}). "
-            "The composed combo needs one slot per adapter — raise --max-loras or remove it to auto-size."
+            "Composition needs one slot per adapter — raise --max-loras or remove it to auto-size."
         )
 
     cache_config = None
@@ -682,10 +677,12 @@ def main():
     if args.lora_path:
         print(f"  Init-time LoRA: scale={args.lora_scale}")
     if lora_is_per_request:
-        print(f"  Per-request LoRA combos ({len(lora_combos)}):")
-        for idx, combo in enumerate(lora_combos):
-            print(f"    [{idx}] {combo[2]}")
+        print(f"  Per-request LoRA ({len(lora_requests)}):")
+        for idx, (req, scale) in enumerate(zip(lora_requests, lora_scales)):
+            print(f"    [{idx}] {req.lora_name} scale={scale}")
     print(f"  Prompts: {len(prompts)}")
+    if axes:
+        print(f"  Axes: {', '.join(f'{a.name}={a.type}:{len(a.values)} values' for a in axes.values())}")
     if args.stage_configs_path:
         print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
@@ -698,40 +695,72 @@ def main():
         "system_prompt": args.system_prompt,
     }
 
-    prompt_batch = [{"prompt": p, "negative_prompt": args.negative_prompt} for p in prompts]
-    # (combo_idx, prompt_idx) -> list of PIL images (length == num_images_per_prompt)
-    cell_images: dict[tuple[int, int], list[Any]] = {}
-
-    generation_start = time.perf_counter()
-    for combo_idx, (lora_reqs, lora_scales, combo_label) in enumerate(lora_combos):
-        # Fresh generator per combo so the seed is the only source of variance
-        # within a cell; across combos the seed is reused so differences isolate
-        # to the LoRA weights (matches the test in tests/e2e/.../test_diffusion_lora.py).
-        combo_generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    def _run_cell(prompt: str, cell: dict) -> list[Any]:
+        gen = torch.Generator(device=current_omni_platform.device_type).manual_seed(cell["seed"])
         sp = OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
-            generator=combo_generator,
+            generator=gen,
             true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
+            guidance_scale=cell["guidance_scale"],
             guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
+            num_inference_steps=cell["num_inference_steps"],
             num_outputs_per_prompt=args.num_images_per_prompt,
-            lora_requests=lora_reqs,
-            lora_scales=lora_scales,
+            lora_requests=lora_requests if lora_is_per_request else [],
+            lora_scales=cell["lora_scales"] if lora_is_per_request else [],
             extra_args=extra_args,
         )
-        print(f"[combo {combo_idx}/{len(lora_combos) - 1}] {combo_label} ...")
-        combo_outputs = omni.generate(prompt_batch, sp)
-        if len(combo_outputs) != len(prompts):
-            raise ValueError(f"Expected {len(prompts)} outputs for combo {combo_idx}, got {len(combo_outputs)}.")
-        for p_idx, out in enumerate(combo_outputs):
-            if not getattr(out, "request_output", None) or not hasattr(out.request_output, "images"):
-                raise ValueError(f"Combo {combo_idx} prompt {p_idx}: missing request_output.images")
-            imgs = out.request_output.images
-            if not imgs:
-                raise ValueError(f"Combo {combo_idx} prompt {p_idx}: empty image list")
-            cell_images[(p_idx, combo_idx)] = imgs
+        outs = omni.generate([{"prompt": prompt, "negative_prompt": args.negative_prompt}], sp)
+        if not outs or not getattr(outs[0], "request_output", None):
+            raise ValueError("Generate returned no request_output")
+        imgs = outs[0].request_output.images
+        if not imgs:
+            raise ValueError("Empty image list from generate")
+        return imgs
+
+    defaults = {
+        "prompt": prompts[0],
+        "lora_scales": list(lora_scales),
+        "guidance_scale": args.guidance_scale,
+        "num_inference_steps": args.num_inference_steps,
+        "seed": args.seed,
+    }
+
+    # (z_idx, y_idx, x_idx) -> images for one cell. Unused axes collapse to idx 0.
+    cell_images: dict[tuple[int, int, int], list[Any]] = {}
+
+    generation_start = time.perf_counter()
+
+    if axes:
+        x_axis, y_axis, z_axis = axes.get("x"), axes.get("y"), axes.get("z")
+        z_values = z_axis.values if z_axis else [None]
+        y_values = y_axis.values if y_axis else [None]
+        x_values = x_axis.values if x_axis else [None]
+
+        total = len(z_values) * len(y_values) * len(x_values)
+        counter = 0
+        for z_idx, z_val in enumerate(z_values):
+            for y_idx, y_val in enumerate(y_values):
+                for x_idx, x_val in enumerate(x_values):
+                    cell = dict(defaults)
+                    for ax, raw in ((x_axis, x_val), (y_axis, y_val), (z_axis, z_val)):
+                        if ax is not None:
+                            _apply_axis(ax, raw, cell, len(lora_requests))
+                    counter += 1
+                    label = " ".join(
+                        f"{ax.name}={raw}"
+                        for ax, raw in ((x_axis, x_val), (y_axis, y_val), (z_axis, z_val))
+                        if ax is not None
+                    )
+                    print(f"[cell {counter}/{total}] {label}")
+                    cell_images[(z_idx, y_idx, x_idx)] = _run_cell(cell["prompt"], cell)
+    else:
+        # No axes: generate one image per prompt; cell key (0, p_idx, 0).
+        cell = dict(defaults)
+        for p_idx, prompt in enumerate(prompts):
+            cell["prompt"] = prompt
+            print(f"[cell {p_idx + 1}/{len(prompts)}] prompt={prompt!r}")
+            cell_images[(0, p_idx, 0)] = _run_cell(prompt, cell)
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -756,49 +785,46 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    logger.info("Produced %d cells (combos=%d, prompts=%d)", len(cell_images), len(lora_combos), len(prompts))
+    logger.info("Produced %d cells", len(cell_images))
 
     if args.output_dir:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        if args.xy_sweep:
-            # Re-key cell_images from (p_idx=0, combo_idx) to (y_idx, x_idx) for the XY grid.
-            n = len(args.xy_sweep)
-            xy_images: dict[tuple[int, int], list[Any]] = {}
-            for (_p_idx, c_idx), imgs in cell_images.items():
-                y_idx, x_idx = divmod(c_idx, n)
-                xy_images[(y_idx, x_idx)] = imgs
-            for (y_idx, x_idx), imgs in xy_images.items():
-                for n_idx, img in enumerate(imgs):
-                    save_path = out_dir / f"xy_x{x_idx:02d}_y{y_idx:02d}_n{n_idx:02d}.png"
-                    img.save(save_path)
-                    print(f"Saved {save_path}")
-            x_name = Path(args.lora_paths[0]).name
-            y_name = Path(args.lora_paths[1]).name
-            grid = _compose_xy_grid(xy_images, scales=list(args.xy_sweep),
-                                    x_axis_name=x_name, y_axis_name=y_name)
-            grid_path = out_dir / "grid.png"
-            grid.save(grid_path)
-            print(f"Saved XY-sweep grid to {grid_path}")
-        else:
-            for (p_idx, c_idx), imgs in cell_images.items():
-                for n_idx, img in enumerate(imgs):
-                    save_path = out_dir / f"p{p_idx:02d}_c{c_idx:02d}_n{n_idx:02d}.png"
-                    img.save(save_path)
-                    print(f"Saved {save_path}")
-            if args.xyz:
-                col_labels = [combo[2] for combo in lora_combos]
-                row_labels = list(prompts)
+        for (z_idx, y_idx, x_idx), imgs in cell_images.items():
+            for n_idx, img in enumerate(imgs):
+                save_path = out_dir / f"cell_x{x_idx:02d}_y{y_idx:02d}_z{z_idx:02d}_n{n_idx:02d}.png"
+                img.save(save_path)
+                print(f"Saved {save_path}")
+
+        if axes:
+            x_axis, y_axis, z_axis = axes.get("x"), axes.get("y"), axes.get("z")
+            lora_names = [req.lora_name for req in lora_requests]
+            col_labels = [_axis_label(x_axis, v, lora_names) for v in x_axis.values] if x_axis else None
+            row_labels = [_axis_label(y_axis, v, lora_names) for v in y_axis.values] if y_axis else None
+            num_cols = len(x_axis.values) if x_axis else 1
+            num_rows = len(y_axis.values) if y_axis else 1
+
+            z_values = z_axis.values if z_axis else [None]
+            for z_idx, z_val in enumerate(z_values):
+                slice_cells = {
+                    (y, x): imgs
+                    for (z, y, x), imgs in cell_images.items() if z == z_idx
+                }
+                title = (
+                    f"Z: {_axis_label(z_axis, z_val, lora_names)}" if z_axis else None
+                )
                 grid = _compose_grid(
-                    cell_images,
-                    num_rows=len(prompts),
-                    num_cols=len(lora_combos),
+                    slice_cells,
+                    num_rows=num_rows,
+                    num_cols=num_cols,
                     row_labels=row_labels,
                     col_labels=col_labels,
+                    title=title,
                 )
-                grid_path = out_dir / "grid.png"
+                fname = f"grid_z{z_idx:02d}.png" if z_axis else "grid.png"
+                grid_path = out_dir / fname
                 grid.save(grid_path)
-                print(f"Saved XYZ grid to {grid_path}")
+                print(f"Saved grid to {grid_path}")
     else:
         # Single-output mode: exactly one cell, one image.
         only_images = next(iter(cell_images.values()))
