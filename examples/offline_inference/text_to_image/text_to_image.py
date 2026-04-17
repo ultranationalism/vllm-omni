@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -249,6 +250,18 @@ def parse_args() -> argparse.Namespace:
         "Requires --output-dir and at least one --lora-paths entry.",
     )
     parser.add_argument(
+        "--xy-sweep",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="SCALE",
+        help="XY scale-sweep mode: requires exactly 2 --lora-paths and a single prompt. "
+        "Produces an N×N grid where the first adapter's scale varies along X (columns) "
+        "and the second along Y (rows); both axes use the scale values listed here. "
+        "Cells are labeled with scale values; axis headers show adapter names. "
+        "Mutually exclusive with --xyz.",
+    )
+    parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
         default=1,
@@ -365,6 +378,20 @@ def _resolve_lora_combos(args: argparse.Namespace) -> tuple[list[tuple[list[LoRA
     requests = [_build_lora_request(p) for p in lora_paths]
     names = [req.lora_name for req in requests]
 
+    if args.xy_sweep:
+        if args.xyz:
+            raise ValueError("--xy-sweep and --xyz are mutually exclusive.")
+        if len(requests) != 2:
+            raise ValueError(f"--xy-sweep requires exactly 2 --lora-paths, got {len(requests)}.")
+        scales = list(args.xy_sweep)
+        # y-major order so combo_idx = y_idx * N + x_idx recovers the 2D shape later.
+        combos_xy: list[tuple[list[LoRARequest], list[float], str]] = []
+        for y_scale in scales:
+            for x_scale in scales:
+                label = f"{names[0]}={x_scale:.2f}|{names[1]}={y_scale:.2f}"
+                combos_xy.append((requests, [x_scale, y_scale], label))
+        return combos_xy, True
+
     if not args.xyz:
         label = "+".join(f"{n}({s:.2f})" for n, s in zip(names, lora_scales))
         return [(requests, lora_scales, label)], True
@@ -383,15 +410,115 @@ def _compose_grid(
     results: dict[tuple[int, int], list[Any]],
     num_rows: int,
     num_cols: int,
+    row_labels: list[str] | None = None,
+    col_labels: list[str] | None = None,
 ) -> Any:
-    """Stitch the first image of each (row, col) cell into a single grid PIL image."""
-    from PIL import Image
+    """Stitch the first image of each (row, col) cell into a single grid PIL image.
+
+    If ``row_labels`` or ``col_labels`` are provided, reserve left/top strips and
+    render the labels so the viewer can tell what each cell represents.
+    """
+    from PIL import Image, ImageDraw
 
     sample = next(iter(results.values()))[0]
     cell_w, cell_h = sample.width, sample.height
-    grid = Image.new("RGB", (cell_w * num_cols, cell_h * num_rows), color="white")
+
+    top = max(64, cell_h // 10) if col_labels else 0
+    left = max(128, cell_w // 6) if row_labels else 0
+
+    grid = Image.new("RGB", (left + cell_w * num_cols, top + cell_h * num_rows), color="white")
+
+    if col_labels or row_labels:
+        draw = ImageDraw.Draw(grid)
+        font = _load_label_font(max(18, (top or cell_h // 10) // 3))
+        if col_labels:
+            for c_idx, lbl in enumerate(col_labels):
+                x = left + c_idx * cell_w + cell_w // 2
+                draw.text((x, top // 2), lbl, fill="black", font=font, anchor="mm")
+        if row_labels:
+            for r_idx, lbl in enumerate(row_labels):
+                y = top + r_idx * cell_h + cell_h // 2
+                wrapped = "\n".join(textwrap.wrap(lbl, width=14)) or lbl
+                draw.text((left // 2, y), wrapped, fill="black", font=font, anchor="mm", align="center")
+
     for (r, c), imgs in results.items():
-        grid.paste(imgs[0], (c * cell_w, r * cell_h))
+        grid.paste(imgs[0], (left + c * cell_w, top + r * cell_h))
+    return grid
+
+
+def _load_label_font(size: int):
+    """Return a readable TrueType font if available, otherwise PIL's default bitmap font."""
+    from PIL import ImageFont
+
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def _compose_xy_grid(
+    results: dict[tuple[int, int], list[Any]],
+    scales: list[float],
+    x_axis_name: str,
+    y_axis_name: str,
+) -> Any:
+    """Stitch an N×N scale-sweep into a single image with X (columns) and Y (rows) axis labels.
+
+    Layout:
+      - top strip shows ``X: {x_axis_name}`` centered across columns, then each column's scale.
+      - left strip shows ``Y: {y_axis_name}`` stacked vertically, then each row's scale.
+    """
+    from PIL import Image, ImageDraw
+
+    sample = next(iter(results.values()))[0]
+    cell_w, cell_h = sample.width, sample.height
+    n = len(scales)
+
+    top = max(160, cell_h // 7)
+    left = max(240, cell_w // 5)
+
+    font_title = _load_label_font(max(22, top // 4))
+    font_tick = _load_label_font(max(28, top // 3))
+
+    grid = Image.new("RGB", (left + cell_w * n, top + cell_h * n), color="white")
+    draw = ImageDraw.Draw(grid)
+
+    # X axis title: centered across the column area, in the upper half of the top strip.
+    draw.text(
+        (left + (cell_w * n) // 2, top // 4),
+        f"X: {x_axis_name}",
+        fill="black", font=font_title, anchor="mm",
+    )
+    # Y axis title: stacked one character per line in the left half of the left strip.
+    y_title = f"Y: {y_axis_name}"
+    draw.text(
+        (left // 4, top + (cell_h * n) // 2),
+        "\n".join(y_title),
+        fill="black", font=font_title, anchor="mm", align="center",
+    )
+
+    # Scale ticks: column scales under the X title, row scales beside the Y title.
+    for i, s in enumerate(scales):
+        draw.text(
+            (left + i * cell_w + cell_w // 2, top - top // 4),
+            f"{s:.2f}",
+            fill="black", font=font_tick, anchor="mm",
+        )
+        draw.text(
+            (left - left // 4, top + i * cell_h + cell_h // 2),
+            f"{s:.2f}",
+            fill="black", font=font_tick, anchor="mm",
+        )
+
+    for (r, c), imgs in results.items():
+        grid.paste(imgs[0], (left + c * cell_w, top + r * cell_h))
+
     return grid
 
 
@@ -404,14 +531,24 @@ def main():
 
     # --output-dir is required whenever the script produces more than one image
     # (multiple prompts, multiple LoRA combos, or num_images_per_prompt > 1).
-    requires_output_dir = len(prompts) > 1 or len(lora_combos) > 1 or args.num_images_per_prompt > 1 or args.xyz
+    requires_output_dir = (
+        len(prompts) > 1
+        or len(lora_combos) > 1
+        or args.num_images_per_prompt > 1
+        or args.xyz
+        or bool(args.xy_sweep)
+    )
     if requires_output_dir and not args.output_dir:
         raise ValueError(
             "--output-dir is required when running multiple prompts, multiple LoRA combos, "
-            "multiple images per prompt, or --xyz. Single --output is only valid for one image."
+            "multiple images per prompt, --xyz, or --xy-sweep. Single --output is only valid for one image."
         )
     if args.xyz and not lora_is_per_request:
         raise ValueError("--xyz requires --lora-paths to define the adapters to plot.")
+    if args.xy_sweep and len(prompts) != 1:
+        raise ValueError(
+            f"--xy-sweep requires exactly one prompt (both grid axes are consumed by the LoRA scales), got {len(prompts)}."
+        )
     if args.max_loras is not None and args.lora_paths and args.max_loras < len(args.lora_paths):
         raise ValueError(
             f"--max-loras ({args.max_loras}) is smaller than len(--lora-paths) ({len(args.lora_paths)}). "
@@ -624,16 +761,44 @@ def main():
     if args.output_dir:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        for (p_idx, c_idx), imgs in cell_images.items():
-            for n_idx, img in enumerate(imgs):
-                save_path = out_dir / f"p{p_idx:02d}_c{c_idx:02d}_n{n_idx:02d}.png"
-                img.save(save_path)
-                print(f"Saved {save_path}")
-        if args.xyz:
-            grid = _compose_grid(cell_images, num_rows=len(prompts), num_cols=len(lora_combos))
+        if args.xy_sweep:
+            # Re-key cell_images from (p_idx=0, combo_idx) to (y_idx, x_idx) for the XY grid.
+            n = len(args.xy_sweep)
+            xy_images: dict[tuple[int, int], list[Any]] = {}
+            for (_p_idx, c_idx), imgs in cell_images.items():
+                y_idx, x_idx = divmod(c_idx, n)
+                xy_images[(y_idx, x_idx)] = imgs
+            for (y_idx, x_idx), imgs in xy_images.items():
+                for n_idx, img in enumerate(imgs):
+                    save_path = out_dir / f"xy_x{x_idx:02d}_y{y_idx:02d}_n{n_idx:02d}.png"
+                    img.save(save_path)
+                    print(f"Saved {save_path}")
+            x_name = Path(args.lora_paths[0]).name
+            y_name = Path(args.lora_paths[1]).name
+            grid = _compose_xy_grid(xy_images, scales=list(args.xy_sweep),
+                                    x_axis_name=x_name, y_axis_name=y_name)
             grid_path = out_dir / "grid.png"
             grid.save(grid_path)
-            print(f"Saved XYZ grid to {grid_path}")
+            print(f"Saved XY-sweep grid to {grid_path}")
+        else:
+            for (p_idx, c_idx), imgs in cell_images.items():
+                for n_idx, img in enumerate(imgs):
+                    save_path = out_dir / f"p{p_idx:02d}_c{c_idx:02d}_n{n_idx:02d}.png"
+                    img.save(save_path)
+                    print(f"Saved {save_path}")
+            if args.xyz:
+                col_labels = [combo[2] for combo in lora_combos]
+                row_labels = list(prompts)
+                grid = _compose_grid(
+                    cell_images,
+                    num_rows=len(prompts),
+                    num_cols=len(lora_combos),
+                    row_labels=row_labels,
+                    col_labels=col_labels,
+                )
+                grid_path = out_dir / "grid.png"
+                grid.save(grid_path)
+                print(f"Saved XYZ grid to {grid_path}")
     else:
         # Single-output mode: exactly one cell, one image.
         only_images = next(iter(cell_images.values()))
