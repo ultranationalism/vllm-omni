@@ -1347,7 +1347,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
-                _parse_lora_request(request.lora)
+                _parse_lora_requests(request.lora)
                 extra_body["lora"] = request.lora
 
             generation_result = await chat_handler.generate_diffusion_images(

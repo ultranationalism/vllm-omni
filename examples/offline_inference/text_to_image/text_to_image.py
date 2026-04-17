@@ -248,10 +248,10 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         metavar="SPEC",
-        help='XYZ axis. Repeat up to 3 times. Spec form: NAME=TYPE:v1|v2|v3 where '
-        'NAME ∈ {x,y,z} and TYPE ∈ {prompt, lora_scale[i], guidance_scale, '
-        'num_inference_steps, seed}. The Cartesian product of X×Y×Z defines cells: '
-        'X is columns, Y is rows, Z produces one grid per value (grid_z{k}.png). '
+        help="XYZ axis. Repeat up to 3 times. Spec form: NAME=TYPE:v1|v2|v3 where "
+        "NAME ∈ {x,y,z} and TYPE ∈ {prompt, lora_scale[i], guidance_scale, "
+        "num_inference_steps, seed}. The Cartesian product of X×Y×Z defines cells: "
+        "X is columns, Y is rows, Z produces one grid per value (grid_z{k}.png). "
         'Example: --axis "x=lora_scale[0]:0|1" --axis "y=lora_scale[1]:0|1" '
         '--axis "z=prompt:a girl|a cat" yields a 2×2 grid per prompt.',
     )
@@ -486,7 +486,10 @@ def _compose_grid(
     if title:
         draw.text(
             (grid.size[0] // 2, title_strip // 2),
-            title, fill="black", font=font_title, anchor="mm",
+            title,
+            fill="black",
+            font=font_title,
+            anchor="mm",
         )
     if col_labels:
         for c_idx, lbl in enumerate(col_labels):
@@ -516,11 +519,9 @@ def _load_label_font(size: int):
     ):
         try:
             return ImageFont.truetype(candidate, size=size)
-        except (OSError, IOError):
+        except OSError:
             continue
     return ImageFont.load_default()
-
-
 
 
 def main():
@@ -536,9 +537,7 @@ def main():
             "--axis cannot be combined with multi-prompt input; put prompts on the prompt axis instead, "
             'e.g. --axis "z=prompt:a|b".'
         )
-    requires_output_dir = (
-        len(prompts) > 1 or args.num_images_per_prompt > 1 or bool(axes)
-    )
+    requires_output_dir = len(prompts) > 1 or args.num_images_per_prompt > 1 or bool(axes)
     if requires_output_dir and not args.output_dir:
         raise ValueError(
             "--output-dir is required when running multiple prompts, multiple images per prompt, "
@@ -806,13 +805,8 @@ def main():
 
             z_values = z_axis.values if z_axis else [None]
             for z_idx, z_val in enumerate(z_values):
-                slice_cells = {
-                    (y, x): imgs
-                    for (z, y, x), imgs in cell_images.items() if z == z_idx
-                }
-                title = (
-                    f"Z: {_axis_label(z_axis, z_val, lora_names)}" if z_axis else None
-                )
+                slice_cells = {(y, x): imgs for (z, y, x), imgs in cell_images.items() if z == z_idx}
+                title = f"Z: {_axis_label(z_axis, z_val, lora_names)}" if z_axis else None
                 grid = _compose_grid(
                     slice_cells,
                     num_rows=num_rows,

@@ -79,8 +79,7 @@ class StageDiffusionProc:
             from vllm.lora.request import LoRARequest
 
             sampling_params_dict["lora_requests"] = [
-                req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest)
-                for req in lora_reqs
+                req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_reqs
             ]
 
         return OmniDiffusionSamplingParams(**sampling_params_dict)
