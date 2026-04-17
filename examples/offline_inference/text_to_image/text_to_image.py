@@ -594,7 +594,7 @@ def main():
             imgs = out.request_output.images
             if not imgs:
                 raise ValueError(f"Combo {combo_idx} prompt {p_idx}: empty image list")
-            cell_images[(combo_idx, p_idx)] = imgs
+            cell_images[(p_idx, combo_idx)] = imgs
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -624,7 +624,7 @@ def main():
     if args.output_dir:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        for (c_idx, p_idx), imgs in cell_images.items():
+        for (p_idx, c_idx), imgs in cell_images.items():
             for n_idx, img in enumerate(imgs):
                 save_path = out_dir / f"p{p_idx:02d}_c{c_idx:02d}_n{n_idx:02d}.png"
                 img.save(save_path)
