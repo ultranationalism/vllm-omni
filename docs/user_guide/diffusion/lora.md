@@ -152,7 +152,7 @@ outputs = omni.generate(
 
 **CLI:**
 
-The example CLI exposes `--lora-paths` + `--lora-scales` for per-request composition, and `--xyz` for a baseline vs. single-LoRA vs. composed matrix plot:
+The example CLI exposes `--lora-paths` + `--lora-scales` for per-request composition, and `--axis` for Cartesian-product XYZ plots that can put any parameter on any of the three axes. Supported axis types are `prompt`, `lora_scale[i]` (i-th `--lora-paths` entry), `guidance_scale`, `num_inference_steps`, and `seed`. X is columns, Y is rows, Z writes one `grid_z{k}.png` per value.
 
 ```bash
 # Compose two adapters on one prompt
@@ -164,15 +164,15 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --max-loras 2 \
   --output-dir outputs/composed/
 
-# XYZ plot: rows = prompts, cols = {baseline, A, B, A+B}
+# 2×2 LoRA-scale grid across 2 prompts (Z): produces grid_z00.png + grid_z01.png
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model Tongyi-MAI/Z-Image-Turbo \
-  --prompts "A piece of cheesecake" "A cat sitting on a laptop" \
   --lora-paths /lora/a /lora/b \
-  --lora-scales 1.0 1.0 \
   --max-loras 2 \
-  --xyz \
-  --output-dir outputs/xyz/
+  --axis "x=lora_scale[0]:0|1" \
+  --axis "y=lora_scale[1]:0|1" \
+  --axis "z=prompt:a girl|a cat" \
+  --output-dir outputs/axis_test/
 ```
 
 ### Limitations

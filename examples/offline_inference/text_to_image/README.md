@@ -83,7 +83,7 @@ python text_to_image.py \
 | `--height` | int | `1024` | Output image height in pixels |
 | `--width` | int | `1024` | Output image width in pixels |
 | `--output` | str | `"qwen_image_output.png"` | Single-image output file path (one prompt, one LoRA combo, one image) |
-| `--output-dir` | str | — | Output directory for batch / multi-LoRA / XYZ runs. Files are named `p{prompt_idx}_c{combo_idx}_n{img_idx}.png`; XYZ mode also writes `grid.png`. |
+| `--output-dir` | str | — | Output directory for batch / multi-LoRA / XYZ runs. Files are named `cell_x{x}_y{y}_z{z}_n{n}.png`; `--axis` mode also writes `grid.png` (or `grid_z{k}.png` per Z value). |
 | `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
@@ -96,7 +96,7 @@ python text_to_image.py \
 | `--lora-paths` | str+ | — | One or more PEFT LoRA adapter folders for per-request composition. Mutex with `--lora-path`. |
 | `--lora-scales` | float+ | `[1.0 ...]` | Per-adapter scales for `--lora-paths` (length must match) |
 | `--max-loras` | int | auto | LoRA cache slot count. Defaults to `max(len(--lora-paths), 1)` |
-| `--xyz` | flag | off | Render a `{baseline, each-LoRA, composed}` × prompts matrix plus a stitched `grid.png`. Requires `--lora-paths` and `--output-dir`. |
+| `--axis` | str (repeatable) | — | XYZ plot axis spec `NAME=TYPE:v1\|v2\|...` where NAME ∈ `{x,y,z}` and TYPE ∈ `{prompt, lora_scale[i], guidance_scale, num_inference_steps, seed}`. Cartesian product of axes defines cells; X=cols, Y=rows, Z produces one `grid_z{k}.png` per value. Repeat up to 3 times. |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 
@@ -282,20 +282,36 @@ python text_to_image.py \
   --output-dir outputs/composed/
 ```
 
-**XYZ plot** — render a matrix of `{baseline, each LoRA alone, composed}` × `{prompts}` and stitch the cells into `grid.png`. Useful for eyeballing each adapter's contribution:
+**XYZ plot** — put any parameter on any axis and take the Cartesian product. Each `--axis` has the form `NAME=TYPE:v1|v2|...` where `NAME` is `x` / `y` / `z` and `TYPE` is one of `prompt`, `lora_scale[i]` (targets the i-th `--lora-paths` entry), `guidance_scale`, `num_inference_steps`, or `seed`. X/Y compose a 2D grid; Z writes one `grid_z{k}.png` per value.
+
+```bash
+# 2 × 2 scale sweep of two LoRAs, across 2 prompts (Z)
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --lora-paths /lora/style_a /lora/style_b \
+  --max-loras 2 \
+  --axis "x=lora_scale[0]:0|1" \
+  --axis "y=lora_scale[1]:0|1" \
+  --axis "z=prompt:a girl|a cat" \
+  --output-dir outputs/axis_test/
+```
+
+Baseline-vs-each-LoRA matrix (mirrors the old `--xyz` mode) is a one-axis case:
 
 ```bash
 python text_to_image.py \
   --model Tongyi-MAI/Z-Image-Turbo \
-  --prompts "A piece of cheesecake" "A cat sitting on a laptop" \
+  --prompt "A piece of cheesecake" \
   --lora-paths /lora/style_a /lora/style_b \
-  --lora-scales 1.0 1.0 \
   --max-loras 2 \
-  --xyz \
-  --output-dir outputs/xyz/
+  --axis "x=lora_scale[0]:0|1" \
+  --axis "y=lora_scale[1]:0|1" \
+  --output-dir outputs/composed/
 ```
 
-`--lora-path` and `--lora-paths` are mutually exclusive. `--output-dir` is required whenever the script produces more than one image (multiple prompts, multiple LoRA combos, or `--num-images-per-prompt > 1`).
+Grid cells are labeled with `{adapter}\n{scale}` for LoRA-scale axes and the prompt text for a prompt axis; the Z banner shows the current slice.
+
+`--lora-path` and `--lora-paths` are mutually exclusive. `--output-dir` is required whenever the script produces more than one image (multiple prompts, any `--axis`, or `--num-images-per-prompt > 1`).
 
 LoRA adapters must be in PEFT format. A typical adapter directory structure:
 
