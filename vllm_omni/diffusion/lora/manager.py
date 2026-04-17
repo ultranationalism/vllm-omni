@@ -528,9 +528,20 @@ class DiffusionLoRAManager:
         lora_model: LoRAModel,
         scale: float,
     ) -> None:
-        """Set LoRA weights for a single adapter slot on a single layer."""
+        """Set LoRA weights for a single adapter slot on a single layer.
+
+        Dispatches across four shapes: (1) adapter has no entry for this
+        module — fall through to per-slice suffix lookup for packed layers,
+        otherwise reset the slot; (2) adapter entry is ``PackedLoRALayerWeights``
+        with per-slice tensors already separated; (3) adapter entry is a single
+        fused tensor but the target layer is multi-slice, so split ``lora_b``
+        along ``output_slices``; (4) single-slice fused — apply directly.
+        """
         lora_weights = self._get_lora_weights(lora_model, full_module_name)
 
+        # Case 1: no direct entry. Multi-slice layers may still match via the
+        # unpacked sub-suffixes (e.g. ``q_proj``/``k_proj``/``v_proj`` when
+        # target is a fused ``qkv_proj``); single-slice layers just miss.
         if lora_weights is None:
             n_slices = getattr(lora_layer, "n_slices", 1)
             if n_slices > 1:
@@ -540,6 +551,7 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(slot_index)
                     return
 
+                # Gather per-slice weights; each slice may independently miss.
                 sub_loras: list[LoRALayerWeights | None] = []
                 any_found = False
                 for sub_suffix in sub_suffixes:
@@ -556,6 +568,7 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(slot_index)
                     return
 
+                # Build per-slice A/B lists; None slots leave that slice at zero.
                 lora_a_list: list[torch.Tensor | None] = []
                 lora_b_list: list[torch.Tensor | None] = []
                 for sub_lora in sub_loras:
@@ -569,10 +582,11 @@ class DiffusionLoRAManager:
                 lora_layer.set_lora(index=slot_index, lora_a=lora_a_list, lora_b=lora_b_list)
                 return
             else:
+                # Single-slice layer with no adapter entry: this slot is inactive.
                 lora_layer.reset_lora(slot_index)
                 return
 
-        # Packed LoRA weights already provide per-slice tensors.
+        # Case 2: packed LoRA weights already provide per-slice tensors.
         if isinstance(lora_weights, PackedLoRALayerWeights):
             lora_a_list = lora_weights.lora_a
             lora_b_list = [
@@ -582,7 +596,9 @@ class DiffusionLoRAManager:
             lora_layer.set_lora(index=slot_index, lora_a=lora_a_list, lora_b=lora_b_list)
             return
 
-        # Fused (non-packed) weights: if the layer is multi-slice, split B.
+        # Case 3: fused (non-packed) weights targeting a multi-slice layer.
+        # Split B along ``output_slices`` so each slice receives its portion;
+        # A is shared across slices (standard PEFT fused-QKV convention).
         n_slices = getattr(lora_layer, "n_slices", 1)
         if n_slices > 1:
             output_slices = getattr(lora_layer, "output_slices", None)
@@ -592,6 +608,8 @@ class DiffusionLoRAManager:
 
             total = sum(output_slices)
             if lora_weights.lora_b.shape[0] != total:
+                # Shape mismatch means we can't safely split; skip this layer
+                # rather than silently produce garbage outputs.
                 logger.warning(
                     "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
                     full_module_name,
@@ -607,6 +625,7 @@ class DiffusionLoRAManager:
             lora_layer.set_lora(index=slot_index, lora_a=lora_a_list, lora_b=lora_b_list)
             return
 
+        # Case 4: single-slice fused — apply A and scaled B directly.
         scaled_lora_b = lora_weights.lora_b * scale
         lora_layer.set_lora(index=slot_index, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
 
