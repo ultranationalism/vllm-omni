@@ -16,6 +16,7 @@ from vllm.v1.engine.output_processor import (
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -56,23 +57,21 @@ class OmniRequestState(RequestState):
                 return x
 
             if isinstance(payload, dict):
+                # Keep payload flat (dotted keys like "hidden_states.layer_0")
+                # during accumulation so that all values are tensors/scalars and
+                # the merge logic below works correctly.  Unflatten happens
+                # later in _consolidate_multimodal_tensors after concatenation.
+
                 incoming: dict[str, Any] = {}
                 target_key = self.mm_type or "hidden"
 
                 for k, v in payload.items():
-                    # Normalize producer keys to the modality name.
-                    # AR runners produce {"hidden": ...} and generation
-                    # runners produce {"model_outputs": ...}; remap both
-                    # to the semantic modality key (e.g. "audio", "latent").
                     if k == "model_outputs":
                         k = target_key
                     elif k == "hidden" and target_key != "hidden":
                         k = target_key
 
-                    if isinstance(v, dict):
-                        incoming[k] = {str(sk): _to_cpu(sv) for sk, sv in v.items()}
-                    else:
-                        incoming[k] = _to_cpu(v)
+                    incoming[k] = _to_cpu(v)
             else:
                 key = self.mm_type or "hidden"
                 incoming = {key: _to_cpu(payload)}
@@ -80,20 +79,16 @@ class OmniRequestState(RequestState):
             if self.mm_accumulated is None:
                 self.mm_accumulated = incoming
             else:
-                # Merge keys; accumulate tensors in lists for deferred concatenation
                 for k, v in incoming.items():
                     if k not in self.mm_accumulated:
                         self.mm_accumulated[k] = v
                     else:
                         existing = self.mm_accumulated[k]
                         if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
-                            # Use list accumulation to avoid O(n²) repeated concatenation
                             self.mm_accumulated[k] = [existing, v]
                         elif isinstance(v, torch.Tensor) and isinstance(existing, list):
-                            # Append to existing list
                             existing.append(v)
                         elif isinstance(v, dict) and isinstance(existing, dict):
-                            # Merge nested dicts with list accumulation for tensors
                             for sk, sv in v.items():
                                 if sk not in existing:
                                     existing[sk] = sv
@@ -118,10 +113,9 @@ class OmniRequestState(RequestState):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
                         if k == "audio":
-                            # Concatenate delta audio chunks (1-D) into the full waveform.
-                            # Each entry is a per-step slice; flatten to -1 so chunks with
-                            # inconsistent leading dims can still be joined on the sample axis.
-                            self.mm_accumulated[k] = torch.cat([t.reshape(-1) for t in v], dim=0)
+                            # When the audio tensor shape is inconsistent, torch.cat will fail.
+                            # We need to use torch.cat in -1 dimension.
+                            continue
                         elif k == "sr":
                             # Sample rate is a constant scalar, keep last value.
                             self.mm_accumulated[k] = v[-1]
@@ -140,6 +134,13 @@ class OmniRequestState(RequestState):
                                 v[sk] = sv[-1]
         except Exception:
             logger.exception("Error consolidating multimodal tensors")
+
+        # Restore nested structure from flat dotted keys now that all tensor
+        # lists have been concatenated into single tensors.
+        try:
+            self.mm_accumulated = unflatten_payload(self.mm_accumulated)
+        except Exception:
+            logger.exception("Error unflattening consolidated multimodal tensors")
 
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
